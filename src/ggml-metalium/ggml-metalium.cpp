@@ -2376,7 +2376,10 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
         //      Which means if we try to copy a transposed tensor. We should not transpose it. Else the other
         //      backend would transpose it again.
         ggml_tensor* src = tensor->src[0];
-        bool do_transpose = true;
+        // Since ggml tensor uses stride to express transpose and this is "get buffer" which produce the final data to host memory
+        // Instead of setting do_transpose as true intuitively, we set it to false.
+        // That way we don't suffer from double transpose = no op
+        bool do_transpose = false; 
         while(src->op == GGML_OP_TRANSPOSE) {
             do_transpose = !do_transpose;
             src = src->src[0];
@@ -2385,7 +2388,7 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
         GGML_ASSERT(src != NULL);
         t = realize_ggml_view(src);
         if(do_transpose) {
-            *t = ttnn::transpose(*t, -2, -1);
+            t = std::make_shared<tt::tt_metal::Tensor>(ttnn::transpose(*t, -2, -1));
         }
     }
     else if (tensor->op == GGML_OP_PERMUTE) {
