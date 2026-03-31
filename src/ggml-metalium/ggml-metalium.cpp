@@ -2091,6 +2091,17 @@ static bool ggml_backend_metalium_can_flash_attn(const struct ggml_tensor * dst)
         return false;
     }
 
+    // TT shapes are GGML dims reversed: TT=[ne3, ne2, ne1, ne0]
+    // Non-decode SDPA: Q=[b,nqh,s,dh] K=[b,nkv,s,dh] requires nqh % nkv == 0
+    //   In GGML terms: b=ne3, nqh=ne2, s=ne1, dh=ne0 → check q->ne[2] % k->ne[2]
+    // Decode SDPA: Q=[1,b,nh,dh] K=[b,nkv,s,dh] requires nh % nkv == 0
+    //   In GGML terms: nh=ne1, nkv=ne2 after repeat → check q->ne[1] % k->ne[2]
+    bool can_non_decode = (q->ne[2] % k->ne[2] == 0);
+    bool can_decode = (q->ne[1] % k->ne[2] == 0);
+    if(!can_non_decode && !can_decode) {
+        return false;
+    }
+
     return true;
 }
 
@@ -2123,37 +2134,60 @@ static void ggml_backend_metalium_flash_attn(ggml_backend_metalium_context * ctx
     auto kt = *realize_ggml_view(k);
     auto vt = *realize_ggml_view(v);
 
-    uint32_t b = qt.logical_shape()[1];
-    if(kt.logical_shape()[0] != b) {
-        ttnn::Shape repeat_factor({b, 1, 1, 1});
-        kt = ttnn::repeat(kt, repeat_factor);
-    }
-
-    if(vt.logical_shape()[0] != b) {
-        ttnn::Shape repeat_factor({b, 1, 1, 1});
-        vt = ttnn::repeat(vt, repeat_factor);
-    }
-
     std::optional<ttnn::Tensor> mask_tensor;
     if(mask) {
         mask_tensor = *realize_ggml_view(mask);
-        if(mask_tensor->logical_shape()[0] != b) {
+    }
+
+    // TT shapes from realize_ggml_view are GGML dims reversed: [ne3, ne2, ne1, ne0]
+    // Non-decode SDPA: Q=[b, nqh, s, dh]  K=[b, nkv, s, dh]  requires nqh % nkv == 0
+    //   qt=[ne3, ne2, ne1, ne0] → b=ne3, nqh=ne2, s=ne1, dh=ne0
+    // Decode SDPA:     Q=[1, b, nh, dh]   K=[b, nkv, s, dh]   requires nh % nkv == 0
+    //   qt=[ne3, ne2, ne1, ne0] → 1=ne3, b=ne2, nh=ne1, dh=ne0
+    bool use_decode = (qt.logical_shape()[2] % kt.logical_shape()[1] == 0);
+    bool use_non_decode = (qt.logical_shape()[1] % kt.logical_shape()[1] == 0);
+
+    ttnn::Tensor res;
+    if(use_non_decode && !use_decode) {
+        // Non-decode (prefill) path: Q=[b, nqh, s, dh]
+        res = ttnn::transformer::scaled_dot_product_attention(
+            qt,
+            kt,
+            vt,
+            mask_tensor,
+            false, /* is_causal */
+            scale
+        );
+    } else {
+        // Decode path: Q=[1, b, nh, dh] (original code path)
+        uint32_t b = qt.logical_shape()[1];
+        if(kt.logical_shape()[0] != b) {
+            ttnn::Shape repeat_factor({b, 1, 1, 1});
+            kt = ttnn::repeat(kt, repeat_factor);
+        }
+
+        if(vt.logical_shape()[0] != b) {
+            ttnn::Shape repeat_factor({b, 1, 1, 1});
+            vt = ttnn::repeat(vt, repeat_factor);
+        }
+
+        if(mask_tensor && mask_tensor->logical_shape()[0] != b) {
             ttnn::Shape repeat_factor({b, 1, 1, 1});
             *mask_tensor = ttnn::repeat(*mask_tensor, repeat_factor);
         }
-    }
 
-    auto res = ttnn::transformer::scaled_dot_product_attention_decode(
-        qt,
-        kt,
-        vt,
-        false,
-        mask_tensor,
-        std::vector<uint32_t>{},
-        std::nullopt,
-        std::nullopt,
-        scale
-    );
+        res = ttnn::transformer::scaled_dot_product_attention_decode(
+            qt,
+            kt,
+            vt,
+            false,
+            mask_tensor,
+            std::vector<uint32_t>{},
+            std::nullopt,
+            std::nullopt,
+            scale
+        );
+    }
 
     // HACK: I have no idea why
     if(!ggml_tt_tensors_shape_equal(dst, res)) {
