@@ -2164,8 +2164,67 @@ static void ggml_backend_metalium_flash_attn(ggml_backend_metalium_context * ctx
     };
 }
 
-static void ggml_backend_matalium_pad(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
-    
+static bool ggml_backend_metalium_can_pad(const struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0)) {
+        return false;
+    }
+    // Circular padding not yet supported
+    const int32_t circular = ((const int32_t *)(dst->op_params))[8];
+    if (circular) {
+        return false;
+    }
+    return true;
+}
+
+static void ggml_backend_metalium_pad(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    GGML_UNUSED(ctx);
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
+
+    auto src_tensor = realize_ggml_view(src0);
+
+    // Extract padding parameters from op_params
+    const int32_t lp0 = ((const int32_t *)(dst->op_params))[0];
+    const int32_t rp0 = ((const int32_t *)(dst->op_params))[1];
+    const int32_t lp1 = ((const int32_t *)(dst->op_params))[2];
+    const int32_t rp1 = ((const int32_t *)(dst->op_params))[3];
+    const int32_t lp2 = ((const int32_t *)(dst->op_params))[4];
+    const int32_t rp2 = ((const int32_t *)(dst->op_params))[5];
+    const int32_t lp3 = ((const int32_t *)(dst->op_params))[6];
+    const int32_t rp3 = ((const int32_t *)(dst->op_params))[7];
+
+    const int n_dims = ggml_n_dims(src0);
+
+    // Build padding spec per dimension (GGML dim order matches TTNN: innermost first)
+    // ttnn::pad expects padding for each dimension as {before, after}
+    ttsl::SmallVector<std::array<uint32_t, 2>> padding;
+    // TTNN expects padding specs from outermost to innermost dimension
+    // GGML tensor has dims [ne0, ne1, ne2, ne3] where ne0 is innermost
+    // TTNN shape is [ne3, ne2, ne1, ne0] (outermost first)
+    // We need to provide padding in TTNN dimension order
+    if (n_dims >= 4 || lp3 != 0 || rp3 != 0) {
+        padding.push_back({(uint32_t)lp3, (uint32_t)rp3});
+    }
+    if (n_dims >= 3 || lp2 != 0 || rp2 != 0 || !padding.empty()) {
+        padding.push_back({(uint32_t)lp2, (uint32_t)rp2});
+    }
+    if (n_dims >= 2 || lp1 != 0 || rp1 != 0 || !padding.empty()) {
+        padding.push_back({(uint32_t)lp1, (uint32_t)rp1});
+    }
+    padding.push_back({(uint32_t)lp0, (uint32_t)rp0});
+
+    auto result = ttnn::pad(*src_tensor, padding, 0.0f);
+
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(result),
+    };
 }
 
 // backend interface
@@ -2739,7 +2798,7 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
                 break;
 
             case GGML_OP_PAD:
-
+                ggml_backend_metalium_pad(ctx, node);
                 break;
 
             case GGML_OP_NONE:
@@ -2928,7 +2987,7 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
         case GGML_OP_SET_ROWS:
             return tensor_supported(src1) && ggml_backend_metalium_can_set_rows(op);
         case GGML_OP_PAD:
-            return true;
+            return ggml_backend_metalium_can_pad(op);
         default:
             return false;
     }
