@@ -1049,19 +1049,27 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
     if(res->dtype() != result_type) {
         res = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*res, result_type));
     }
+
+    // Create an independent device copy so the source tensor can be freed independently.
+    // Without this, res aliases the source's device buffer via shared_ptr, preventing
+    // the source from being deallocated when its last GGML consumer finishes.
+    // Using typecast to the same dtype forces TTNN to allocate a new device buffer.
+    auto copied = std::make_shared<tt::tt_metal::Tensor>(
+        ttnn::typecast(*res, res->dtype()));
+
     if(dst->op == GGML_OP_CPY) {
         auto* src1 = dst->src[1];
         GGML_ASSERT(src1 != NULL);
         GGML_ASSERT(src1->extra != NULL);
         ggml_tensor_extra_metalium* src1_meta = (ggml_tensor_extra_metalium*)src1->extra;
         *src1_meta = {
-            .tensor = res,
+            .tensor = copied,
         };
     }
 
     *dst_meta = {
         // TODO: Type cast to the appropriate type
-        .tensor = res,
+        .tensor = copied,
     };
 }
 
