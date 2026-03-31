@@ -1272,8 +1272,6 @@ static void ggml_backend_metalium_scale(ggml_backend_metalium_context * ctx, str
     else {
         res = ttnn::add(ttnn::multiply(*t, scale, std::nullopt, ttnn::L1_MEMORY_CONFIG), bias);
     }
-    // TODO: Support in-place scaling
-    GGML_ASSERT(!is_view(dst->src[0]));
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(res)),
     };
@@ -2198,6 +2196,62 @@ static void ggml_backend_metalium_flash_attn(ggml_backend_metalium_context * ctx
     };
 }
 
+static bool ggml_backend_metalium_can_timestep_embedding(const struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    return true;
+}
+
+static void ggml_backend_metalium_timestep_embedding(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    GGML_UNUSED(ctx);
+
+    ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
+    auto device = ctx->device->get_mesh_device();
+
+    const int dim        = ggml_get_op_params_i32(dst, 0);
+    const int max_period = ggml_get_op_params_i32(dst, 1);
+    const int half       = dim / 2;
+
+    auto src_tensor = realize_ggml_view(dst->src[0]);
+
+    // src_tensor is [1,1,1,N] in TT (GGML [N])
+    // Reshape to [1,1,N,1] for broadcasting
+    auto ts = src_tensor->reshape(ttnn::Shape({1, 1, (uint32_t)dst->src[0]->ne[0], 1}));
+
+    // Create frequency indices: [1,1,1,half]
+    auto freq = ttnn::arange(0, half, 1, tt::tt_metal::DataType::FLOAT32, *device, ttnn::DRAM_MEMORY_CONFIG, ttnn::TILE_LAYOUT);
+    freq = freq.reshape(ttnn::Shape({1, 1, 1, (uint32_t)half}));
+
+    // freq = exp(-log(max_period) * j / half)
+    float scale = -logf((float)max_period) / (float)half;
+    freq = ttnn::exp(ttnn::multiply(freq, scale));
+
+    // args = timesteps * freq, broadcasting [1,1,N,1] * [1,1,1,half] -> [1,1,N,half]
+    auto args = ttnn::multiply(ts, freq);
+
+    // cos and sin
+    auto cos_part = ttnn::cos(args);
+    auto sin_part = ttnn::sin(args);
+
+    // Concatenate [cos, sin] along last dim -> [1,1,N,2*half]
+    std::vector<tt::tt_metal::Tensor> parts = {cos_part, sin_part};
+    auto result = ttnn::concat(parts, 3);
+
+    // If dim is odd, pad one zero at the end of the last dimension
+    if (dim % 2 != 0) {
+        ttnn::SmallVector<std::array<uint32_t, 2>> padding = {{0, 0}, {0, 0}, {0, 0}, {0, 1}};
+        result = ttnn::pad(result, padding, 0.0f);
+    }
+
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(result)),
+    };
+}
+
 static bool ggml_backend_metalium_can_pad(const struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
@@ -2835,6 +2889,10 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
                 ggml_backend_metalium_pad(ctx, node);
                 break;
 
+            case GGML_OP_TIMESTEP_EMBEDDING:
+                ggml_backend_metalium_timestep_embedding(ctx, node);
+                break;
+
             case GGML_OP_NONE:
                 break;
 
@@ -3022,6 +3080,8 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
             return tensor_supported(src1) && ggml_backend_metalium_can_set_rows(op);
         case GGML_OP_PAD:
             return ggml_backend_metalium_can_pad(op);
+        case GGML_OP_TIMESTEP_EMBEDDING:
+            return ggml_backend_metalium_can_timestep_embedding(op);
         default:
             return false;
     }
