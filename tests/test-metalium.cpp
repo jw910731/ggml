@@ -750,6 +750,55 @@ static void add_unittests(std::vector<std::unique_ptr<test_case>>& tests)
         return h2;
     }, "Multi layer perceptron"));
 
+    // Pad operations
+    // Basic right-only padding (ggml_pad API pads on the right side of each dim)
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 32);
+        return ggml_pad(ctx, a, 32, 32, 0, 0);
+    }, "Pad 2D tile aligned"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 30, 28);
+        return ggml_pad(ctx, a, 2, 4, 0, 0);
+    }, "Pad 2D non tile aligned to tile aligned"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        return ggml_pad(ctx, a, 3, 5, 0, 0);
+    }, "Pad 2D non tile aligned result"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+        return ggml_pad(ctx, a, 16, 0, 0, 0);
+    }, "Pad 1D"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 32, 4);
+        return ggml_pad(ctx, a, 0, 0, 2, 0);
+    }, "Pad 3D on dim2"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 16, 4, 2);
+        return ggml_pad(ctx, a, 8, 8, 2, 1);
+    }, "Pad 4D all dims"));
+
+    // ggml_pad_ext: explicit left and right padding per dimension
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 32);
+        return ggml_pad_ext(ctx, a, 4, 4, 2, 2, 0, 0, 0, 0);
+    }, "Pad ext 2D symmetric"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 24, 18);
+        return ggml_pad_ext(ctx, a, 3, 5, 7, 1, 0, 0, 0, 0);
+    }, "Pad ext 2D asymmetric non tile aligned"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 16, 3, 2);
+        return ggml_pad_ext(ctx, a, 2, 2, 4, 4, 1, 1, 0, 1);
+    }, "Pad ext 4D all dims"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 32);
+        return ggml_pad_ext(ctx, a, 0, 0, 0, 0, 0, 0, 0, 0);
+    }, "Pad ext 2D zero padding (identity)"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
+        return ggml_pad_ext(ctx, a, 16, 15, 8, 7, 0, 0, 0, 0);
+    }, "Pad ext 2D small tensor large padding"));
+
     tests.push_back(make_test([](ggml_context* ctx) {
         // A smaller and stripped down version of the MLP Mixer model
         ggml_tensor* in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
