@@ -2724,11 +2724,36 @@ static ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(ggml_backend
     return &buffer_type_map[device_id];
 }
 
+// Follow view_src chain to find the root tensor that owns device memory
+static struct ggml_tensor * find_view_root(struct ggml_tensor * t) {
+    while (t->view_src) {
+        t = t->view_src;
+    }
+    return t;
+}
+
 static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
 
     constexpr int magic_exp = 6;
     constexpr int magic = (1<<6)-1;
+
+    // Build last-use map: for each tensor, the index of the last node that uses it as a source.
+    // We track the view root so we free the actual device memory holder.
+    std::unordered_map<struct ggml_tensor*, int> last_use;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (node->src[s]) {
+                last_use[find_view_root(node->src[s])] = i;
+            }
+        }
+    }
+    // Also mark the final graph output so we never free it
+    if (cgraph->n_nodes > 0) {
+        struct ggml_tensor * final_node = cgraph->nodes[cgraph->n_nodes - 1];
+        last_use[find_view_root(final_node)] = cgraph->n_nodes; // beyond last index
+    }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
@@ -2909,6 +2934,21 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
             fmt::println(stderr, "Mismatched tensor shapes for node '{}' ({}): GGML wants [{}, {}, {}, {}], TTNN generates {}\n"
                 , node->name, ggml_op_name(node->op), node->ne[0], node->ne[1], node->ne[2], node->ne[3], meta->tensor->logical_shape());
             abort();
+        }
+
+        // Release device memory for source tensors whose last consumer just executed.
+        // Only free compute intermediates (tensors that have an op), not weight/param tensors.
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            struct ggml_tensor * src = node->src[s];
+            if (!src) continue;
+            struct ggml_tensor * root = find_view_root(src);
+            auto it = last_use.find(root);
+            if (it != last_use.end() && it->second == i && root->op != GGML_OP_NONE) {
+                auto * root_meta = (ggml_tensor_extra_metalium*)root->extra;
+                if (root_meta && root_meta->tensor) {
+                    root_meta->tensor.reset();
+                }
+            }
         }
 
         if ((i & magic) == 0 && (i >> magic_exp) < (cgraph->n_nodes>>magic_exp)) {
