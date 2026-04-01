@@ -357,6 +357,133 @@ static std::string type_name(ggml_type type)
     return ggml_get_type_traits(type)->type_name;
 }
 
+// CPU reference implementation of Flux-RoPE (interleaved)
+// PE format: [D, L] in GGML ne, with pe[l, 2*p] = cos, pe[l, 2*p+1] = -sin
+// x format:  [D, L, B] in GGML ne
+// Rotation: x' = x*cos - y*(-sin), y' = x*(-sin) + y*cos
+//           = x*cos + y*sin,        = -x*sin + y*cos
+static void flux_rope_cpu_impl(ggml_tensor* dst, int ith, int nth, void* userdata) {
+    (void)ith; (void)nth; (void)userdata;
+
+    const ggml_tensor* x  = dst->src[0];
+    const ggml_tensor* pe = dst->src[1];
+
+    const int64_t D = x->ne[0];
+    const int64_t L = x->ne[1];
+    const int64_t B = x->ne[2];
+
+    const float* x_data  = (const float*)x->data;
+    const float* pe_data = (const float*)pe->data;
+    float* dst_data      = (float*)dst->data;
+
+    for (int64_t b = 0; b < B; b++) {
+        for (int64_t l = 0; l < L; l++) {
+            for (int64_t p = 0; p < D / 2; p++) {
+                const float xe = x_data[b*L*D + l*D + 2*p];
+                const float xo = x_data[b*L*D + l*D + 2*p + 1];
+                const float c  = pe_data[l*D + 2*p];       // cos(theta)
+                const float ns = pe_data[l*D + 2*p + 1];   // -sin(theta)
+
+                dst_data[b*L*D + l*D + 2*p]     = xe * c - xo * ns;
+                dst_data[b*L*D + l*D + 2*p + 1] = xe * ns + xo * c;
+            }
+        }
+    }
+}
+
+// Magic tag for identifying Flux-RoPE custom ops in the metalium backend
+// 0x464C5530 = interleaved
+static constexpr uintptr_t FLUX_ROPE_INTERLEAVED_TAG = 0x464C5530;
+
+static void add_flux_rope_tests(std::vector<std::unique_ptr<test_case>>& tests)
+{
+    // Flux-RoPE interleaved: tile-aligned dimensions
+    tests.push_back(make_test([](ggml_context* ctx) {
+        const int64_t D = 128, L = 64, B = 8;
+        ggml_tensor* x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, L, B);
+        ggml_tensor* pe = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, L);
+        ggml_tensor* args[2] = {x, pe};
+        return ggml_custom_4d(ctx, GGML_TYPE_F32, D, L, B, 1,
+            args, 2, flux_rope_cpu_impl, 1, (void*)FLUX_ROPE_INTERLEAVED_TAG);
+    }, "Flux-RoPE interleaved 128x64x8", 1e-3));
+
+    // Flux-RoPE: small tile-aligned
+    tests.push_back(make_test([](ggml_context* ctx) {
+        const int64_t D = 32, L = 32, B = 1;
+        ggml_tensor* x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, L, B);
+        ggml_tensor* pe = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, L);
+        ggml_tensor* args[2] = {x, pe};
+        return ggml_custom_4d(ctx, GGML_TYPE_F32, D, L, B, 1,
+            args, 2, flux_rope_cpu_impl, 1, (void*)FLUX_ROPE_INTERLEAVED_TAG);
+    }, "Flux-RoPE interleaved 32x32x1", 1e-3));
+
+    // Flux-RoPE: non-tile-aligned D and L (Flux-style d_head=60)
+    tests.push_back(make_test([](ggml_context* ctx) {
+        const int64_t D = 60, L = 50, B = 4;
+        ggml_tensor* x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, L, B);
+        ggml_tensor* pe = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, L);
+        ggml_tensor* args[2] = {x, pe};
+        return ggml_custom_4d(ctx, GGML_TYPE_F32, D, L, B, 1,
+            args, 2, flux_rope_cpu_impl, 1, (void*)FLUX_ROPE_INTERLEAVED_TAG);
+    }, "Flux-RoPE interleaved 60x50x4 (non tile aligned)", 1e-3));
+
+    // Flux-RoPE: large batch (typical Flux: B = N*n_head = 2*24 = 48)
+    tests.push_back(make_test([](ggml_context* ctx) {
+        const int64_t D = 128, L = 256, B = 48;
+        ggml_tensor* x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, L, B);
+        ggml_tensor* pe = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, L);
+        ggml_tensor* args[2] = {x, pe};
+        return ggml_custom_4d(ctx, GGML_TYPE_F32, D, L, B, 1,
+            args, 2, flux_rope_cpu_impl, 1, (void*)FLUX_ROPE_INTERLEAVED_TAG);
+    }, "Flux-RoPE interleaved 128x256x48 (Flux-scale)", 1e-3));
+
+    // Flux-RoPE: single pair (D=2), edge case
+    tests.push_back(make_test([](ggml_context* ctx) {
+        const int64_t D = 2, L = 64, B = 1;
+        ggml_tensor* x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, L, B);
+        ggml_tensor* pe = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, L);
+        ggml_tensor* args[2] = {x, pe};
+        return ggml_custom_4d(ctx, GGML_TYPE_F32, D, L, B, 1,
+            args, 2, flux_rope_cpu_impl, 1, (void*)FLUX_ROPE_INTERLEAVED_TAG);
+    }, "Flux-RoPE interleaved 2x64x1 (minimal D)", 1e-3));
+
+    // --- Non-interleaved tests ---
+    // These mirror apply_rope's non-interleaved path: interleave x, run fused
+    // kernel, un-interleave output.  The graph is executed on both CPU (via the
+    // function-pointer fallback) and metalium (via the tag dispatch), so
+    // comparing the two validates the full pipeline.
+
+    auto make_non_interleaved_test = [&](int64_t D, int64_t L, int64_t B, const char* name) {
+        tests.push_back(make_test([=](ggml_context* ctx) {
+            // x in non-interleaved layout: [D, L, B]
+            // Data order per row: [x0, x1, ..., x_{D/2-1}, y0, y1, ..., y_{D/2-1}]
+            ggml_tensor* x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, L, B);
+            ggml_tensor* pe = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, L);
+
+            // Interleave x: [D, L, B] -> [D/2, 2, L, B] -> permute(1,0,2,3) -> [2, D/2, L, B] -> cont -> [D, L, B]
+            auto x_prep = ggml_reshape_4d(ctx, x, D / 2, 2, L, B);
+            x_prep = ggml_cont(ctx, ggml_permute(ctx, x_prep, 1, 0, 2, 3));
+            x_prep = ggml_reshape_3d(ctx, x_prep, D, L, B);
+
+            ggml_tensor* args[2] = {x_prep, pe};
+            auto out = ggml_custom_4d(ctx, GGML_TYPE_F32, D, L, B, 1,
+                args, 2, flux_rope_cpu_impl, 1, (void*)FLUX_ROPE_INTERLEAVED_TAG);
+
+            // Un-interleave output: [D, L, B] -> [2, D/2, L, B] -> permute(1,0,2,3) -> [D/2, 2, L, B] -> cont -> [D, L, B]
+            out = ggml_reshape_4d(ctx, out, 2, D / 2, L, B);
+            out = ggml_cont(ctx, ggml_permute(ctx, out, 1, 0, 2, 3));
+            out = ggml_reshape_3d(ctx, out, D, L, B);
+            return out;
+        }, name, 1e-3));
+    };
+
+    make_non_interleaved_test(128, 64, 8,  "Flux-RoPE non-interleaved 128x64x8");
+    make_non_interleaved_test(32,  32, 1,  "Flux-RoPE non-interleaved 32x32x1");
+    make_non_interleaved_test(60,  50, 4,  "Flux-RoPE non-interleaved 60x50x4 (non tile aligned)");
+    make_non_interleaved_test(128, 256, 48, "Flux-RoPE non-interleaved 128x256x48 (Flux-scale)");
+    make_non_interleaved_test(2,   64, 1,  "Flux-RoPE non-interleaved 2x64x1 (minimal D)");
+}
+
 static void add_unittests(std::vector<std::unique_ptr<test_case>>& tests)
 {
     const ggml_unary_op supported_unary_ops[] = {
@@ -836,6 +963,7 @@ int main(int argc, char ** argv)
 
     std::vector<std::unique_ptr<test_case>> tests;
     add_unittests(tests);
+    add_flux_rope_tests(tests);
 
     ///////////////// put experiment code here /////////////////
     // easier on the eye to find it (also one line to disable UT)
