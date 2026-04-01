@@ -17,6 +17,8 @@
 #include "ttnn/operations/eltwise/binary/binary_composite.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/operations/moreh/moreh_group_norm/moreh_group_norm.hpp"
+#include "ttnn/operations/normalization/groupnorm/groupnorm.hpp"
+#include "ttnn/operations/normalization/groupnorm/groupnorm_input_mask.hpp"
 #include "ttnn/tensor/layout/layout.hpp"
 #include "ttnn/tensor/shape/shape.hpp"
 #include "ttnn/tensor/storage.hpp"
