@@ -2405,6 +2405,14 @@ static bool ggml_backend_metalium_can_pad(const struct ggml_tensor * dst) {
     if (circular) {
         return false;
     }
+    // ttnn::pad does not support front (left) padding
+    const int32_t lp0 = ((const int32_t *)(dst->op_params))[0];
+    const int32_t lp1 = ((const int32_t *)(dst->op_params))[2];
+    const int32_t lp2 = ((const int32_t *)(dst->op_params))[4];
+    const int32_t lp3 = ((const int32_t *)(dst->op_params))[6];
+    if (lp0 != 0 || lp1 != 0 || lp2 != 0 || lp3 != 0) {
+        return false;
+    }
     return true;
 }
 
