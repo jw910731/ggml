@@ -944,6 +944,48 @@ static void add_unittests(std::vector<std::unique_ptr<test_case>>& tests)
     }, "MLP mixer", 1e-3));
 }
 
+static void add_group_norm_tests(std::vector<std::unique_ptr<test_case>>& tests)
+{
+    auto make_gn_test = [&](int64_t W, int64_t H, int64_t C, int64_t N,
+                            int n_groups, float eps, const char* name) {
+        tests.push_back(make_test([=](ggml_context* ctx) {
+            // GGML ne: [W, H, C, N]
+            ggml_tensor* input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, W, H, C, N);
+            return ggml_group_norm(ctx, input, n_groups, eps);
+        }, name, 1e-2));
+    };
+
+    // Basic: 32 groups over 32 channels (1 channel/group), tile-aligned spatial
+    make_gn_test(32, 32, 32, 1, 32, 1e-6f,
+        "GroupNorm 32x32 C=32 G=32 N=1");
+
+    // Typical SD VAE: 32 groups over 128 channels
+    make_gn_test(64, 64, 128, 1, 32, 1e-6f,
+        "GroupNorm 64x64 C=128 G=32 N=1 (SD VAE)");
+
+    // Smaller spatial, more channels
+    make_gn_test(16, 16, 256, 1, 32, 1e-6f,
+        "GroupNorm 16x16 C=256 G=32 N=1");
+
+    // Batch > 1
+    make_gn_test(32, 32, 64, 2, 32, 1e-6f,
+        "GroupNorm 32x32 C=64 G=32 N=2");
+
+    // Non tile-aligned spatial
+    make_gn_test(13, 17, 32, 1, 32, 1e-6f,
+        "GroupNorm 13x17 C=32 G=32 N=1 (non tile-aligned)");
+
+    // Fewer groups
+    make_gn_test(32, 32, 64, 1, 8, 1e-6f,
+        "GroupNorm 32x32 C=64 G=8 N=1");
+
+    // Run twice to test program cache reuse (the original crash)
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 32, 32, 1);
+        return ggml_group_norm(ctx, input, 32, 1e-6f);
+    }, "GroupNorm 32x32 C=32 G=32 N=1 (cache reuse)", 1e-2));
+}
+
 int main(int argc, char ** argv)
 {
     (void)argc;
@@ -964,6 +1006,7 @@ int main(int argc, char ** argv)
     std::vector<std::unique_ptr<test_case>> tests;
     add_unittests(tests);
     add_flux_rope_tests(tests);
+    add_group_norm_tests(tests);
 
     ///////////////// put experiment code here /////////////////
     // easier on the eye to find it (also one line to disable UT)

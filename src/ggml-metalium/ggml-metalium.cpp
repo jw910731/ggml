@@ -1744,6 +1744,7 @@ static void ggml_backend_metalium_arange(ggml_backend_metalium_context * ctx, st
 static void ggml_backend_metalium_group_norm(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
 {
     GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
     GGML_UNUSED(ctx);
 
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
@@ -1752,26 +1753,77 @@ static void ggml_backend_metalium_group_norm(ggml_backend_metalium_context * ctx
     memcpy(&n_groups, dst->op_params, sizeof(n_groups));
     memcpy(&eps, dst->op_params + 1, sizeof(eps));
 
-    // XXX: Moreh's operators needs some cleanup
-    auto tensor = realize_ggml_view(dst->src[0]);
-    auto res = ttnn::moreh_group_norm(
-        *tensor,
+    // GGML ne: [W, H, C, N] → TT shape: [N, C, H, W]
+    const struct ggml_tensor * src0 = dst->src[0];
+    const int64_t W = src0->ne[0];
+    const int64_t H = src0->ne[1];
+    const int64_t C = src0->ne[2];
+    const int64_t N = src0->ne[3];
+
+    auto src_tt = realize_ggml_view(src0);
+    auto* device = src_tt->device();
+
+    // ttnn::group_norm expects [N, 1, H*W, C]
+    // Current TT tensor is [N, C, H, W] in TILE layout
+    // Permute [N, C, H, W] → [N, H, W, C] then reshape to [N, 1, H*W, C]
+    ttsl::SmallVector<int64_t> perm_to_nhwc = {0, 2, 3, 1};
+    auto input = ttnn::permute(*src_tt, perm_to_nhwc);
+    input = ttnn::reshape(input, ttnn::Shape({(uint32_t)N, 1, (uint32_t)(H * W), (uint32_t)C}));
+
+    // Ensure TILE layout for the non-sharded path
+    if (input.layout() != tt::tt_metal::Layout::TILE) {
+        input = ttnn::tilize_with_zero_padding(input);
+    }
+
+    // Create input mask (host tensor → device)
+    auto input_mask = ttnn::operations::normalization::create_group_norm_input_mask(
+        C, n_groups, /*num_cores_across_channel=*/1, tt::tt_metal::DataType::BFLOAT16);
+    input_mask = input_mask.to_device(device);
+    input_mask = ttnn::tilize_with_zero_padding(input_mask);
+
+    // Create gamma (ones) and beta (zeros) in ROW_MAJOR [1, 1, C/32, 32]
+    uint32_t tiles_per_core = (uint32_t)(C / 32);
+    auto gamma = ttnn::ones(ttnn::Shape({1, 1, tiles_per_core, 32}),
+        tt::tt_metal::DataType::BFLOAT16, tt::tt_metal::Layout::ROW_MAJOR, std::nullopt, std::nullopt);
+    gamma = gamma.to_device(device);
+
+    auto beta = ttnn::zeros(ttnn::Shape({1, 1, tiles_per_core, 32}),
+        tt::tt_metal::DataType::BFLOAT16, tt::tt_metal::Layout::ROW_MAJOR, std::nullopt, std::nullopt);
+    beta = beta.to_device(device);
+
+    // Compute num_out_blocks to keep per-block L1 usage within limits (~1.5MB L1)
+    // Each block processes (H*W / num_out_blocks) spatial elements across C channels
+    // Working set ≈ (HW/blocks) * C * 2bytes * ~3 buffers
+    const int64_t HW = H * W;
+    int num_out_blocks = std::max((int64_t)1, (HW * C * 6) / (1024 * 1024));
+
+    // Call ttnn::group_norm
+    auto result = ttnn::group_norm(
+        input,
         n_groups,
         eps,
-        std::nullopt,
-        std::nullopt,
-        std::vector<bool>{true, false, false},
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt);
-    GGML_ASSERT(res[0].has_value());
-    *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(*res[0]),
-    };
+        input_mask,       // input_mask
+        gamma,            // weight
+        beta,             // bias
+        std::nullopt,     // reciprocals
+        std::nullopt,     // memory_config
+        std::nullopt,     // dtype
+        ttnn::CoreGrid{1, 1},  // core_grid
+        false,            // inplace (must be false for TILE input)
+        tt::tt_metal::Layout::TILE,  // output_layout
+        num_out_blocks,   // num_out_blocks
+        std::nullopt,     // compute_kernel_config
+        std::nullopt,     // negative_mask
+        false);           // use_welford
+
+    // Reshape back: [N, 1, H*W, C] → [N, H, W, C] → permute to [N, C, H, W]
+    result = ttnn::reshape(result, ttnn::Shape({(uint32_t)N, (uint32_t)H, (uint32_t)W, (uint32_t)C}));
+    ttsl::SmallVector<int64_t> perm_to_nchw = {0, 3, 1, 2};
+    result = ttnn::permute(result, perm_to_nchw);
+
+    ggml_tensor_extra_metalium out_meta;
+    out_meta.tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(result));
+    *dst_meta = out_meta;
 }
 
 static bool ggml_backend_metalium_can_repeat(const struct ggml_tensor * dst)
@@ -3180,7 +3232,15 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
         case GGML_OP_SUM:
             return true;
         case GGML_OP_GROUP_NORM:
-            return false; // Disabled because the operator seems to be broken
+        {
+            // ttnn::group_norm requires C and H*W to be multiples of 32 (tile size)
+            // and C must be divisible by n_groups
+            int n_groups_gn;
+            memcpy(&n_groups_gn, op->op_params, sizeof(n_groups_gn));
+            int64_t C_gn = src0->ne[2];
+            int64_t HW_gn = src0->ne[0] * src0->ne[1];
+            return (C_gn % 32 == 0) && (HW_gn % 32 == 0) && (C_gn % n_groups_gn == 0);
+        }
         case GGML_OP_SUM_ROWS:
             return ggml_backend_metalium_can_sum_rows(op);
 
