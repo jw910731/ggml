@@ -754,6 +754,11 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
 
         // Fast path if we can just return the parent tensor (view is a no-op)
         if(dst_size == src_size && dst_stride == src_stride && offset == 0) {
+            // The parent's TT shape may differ from the view's shape (e.g. when
+            // view_src was reshaped before the view).  Reshape to match.
+            if(!ggml_tt_tensors_shape_equal(tensor, *parent)) {
+                return std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(*parent, tensor));
+            }
             return parent;
         }
         //TODO: Handle strided views (seems to be unused in the current codebase)
@@ -814,6 +819,58 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
             std::array<uint32_t, GGML_MAX_DIMS> step = {1, 1, 1, 1};
             tt::tt_metal::Tensor tmp = ttnn::slice(*parent, start, end, step);
             res = reshape_tt_tensor_into_ggml(tmp, tensor);
+        }
+        // Strided view: the view's strides don't match contiguous strides for its shape,
+        // meaning it selects a sub-block from a higher-dimensional source by skipping
+        // elements along one or more dimensions (e.g., ggml_view_3d extracting a slice
+        // from a 4D tensor).  We reshape the parent to the source shape, compute which
+        // sub-block the view selects using offset + stride matching, and slice.
+        else if([&]() {
+            // Check if this is a strided view: dst strides differ from what contiguous would be
+            size_t expected = ggml_type_size(tensor->type);
+            for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                if (tensor->ne[i] > 1 && tensor->nb[i] != expected) return true;
+                expected *= tensor->ne[i];
+            }
+            return false;
+        }()) {
+            // Map each view dimension to a source dimension via stride matching,
+            // then determine the slice range in source coordinates.
+            auto tmp = std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(*parent, src0));
+            std::array<uint32_t, GGML_MAX_DIMS> sl_start{}, sl_end{};
+            // Initialize end to full source extents
+            for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                sl_start[i] = 0;
+                sl_end[i] = (uint32_t)src0->ne[i];
+            }
+            // Decompose byte offset into source coordinates
+            size_t remaining = offset;
+            for (int i = GGML_MAX_DIMS - 1; i >= 0; i--) {
+                sl_start[i] = remaining / src0->nb[i];
+                remaining = remaining % src0->nb[i];
+            }
+            // For each source dimension, check if it's consumed by a view dimension
+            // (stride match) or collapsed (view doesn't use it → slice size 1)
+            for (int si = 0; si < GGML_MAX_DIMS; si++) {
+                bool matched = false;
+                for (int di = 0; di < GGML_MAX_DIMS; di++) {
+                    if (tensor->ne[di] > 1 && tensor->nb[di] == src0->nb[si]) {
+                        sl_end[si] = sl_start[si] + (uint32_t)tensor->ne[di];
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched && src0->ne[si] > 1) {
+                    // This source dim is not used by the view → take a single slice
+                    sl_end[si] = sl_start[si] + 1;
+                }
+            }
+            // Reverse for TT (GGML innermost-first → TT outermost-first)
+            std::reverse(sl_start.begin(), sl_start.end());
+            std::reverse(sl_end.begin(), sl_end.end());
+            std::array<uint32_t, GGML_MAX_DIMS> step = {1, 1, 1, 1};
+            auto sliced = ttnn::slice(*tmp, sl_start, sl_end, step);
+            res = reshape_tt_tensor_into_ggml(sliced, tensor);
         }
         // The fast path, this is what TTNN is designed for (direct slicing)
         else {
