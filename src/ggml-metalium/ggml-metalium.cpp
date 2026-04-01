@@ -73,6 +73,7 @@
 #include "tmp_rope.hpp"
 #include "tmp_mul_mat.hpp"
 #include "tmp_soft_max.hpp"
+#include "flux_rope.hpp"
 
 extern void metalium_register_all_kernel();
 
@@ -2083,6 +2084,28 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
     };
 }
 
+// Flux-RoPE dispatch: identifies the custom op by userdata tag and dispatches to the fused kernel
+static constexpr uintptr_t FLUX_ROPE_INTERLEAVED_TAG     = 0x464C5530;
+static constexpr uintptr_t FLUX_ROPE_NON_INTERLEAVED_TAG = 0x464C5531;
+
+static void ggml_backend_metalium_flux_rope(ggml_backend_metalium_context * ctx, ggml_tensor * dst, bool rope_interleaved)
+{
+    GGML_UNUSED(ctx);
+
+    // src[0] = x  [D, L, B, 1] in GGML ne (already permuted+cont by the caller)
+    // src[1] = pe [D, L]       in GGML ne (preprocessed: cos/-sin interleaved)
+    ggml_tensor_extra_metalium * dst_meta = (ggml_tensor_extra_metalium *)dst->extra;
+
+    auto x_tt  = realize_ggml_view(dst->src[0]);
+    auto pe_tt = realize_ggml_view(dst->src[1]);
+
+    auto res = ttggml::flux_rope(*x_tt, *pe_tt, rope_interleaved);
+
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(res)),
+    };
+}
+
 static bool ggml_backend_metalium_can_flash_attn(const struct ggml_tensor * dst)
 {
     if(!g_debug_flags.experimental_ops) {
@@ -2983,6 +3006,20 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
                 ggml_backend_metalium_timestep_embedding(ctx, node);
                 break;
 
+            case GGML_OP_CUSTOM:
+            {
+                struct ggml_custom_op_params p;
+                memcpy(&p, node->op_params, sizeof(p));
+                uintptr_t tag = (uintptr_t)p.userdata;
+                if (tag == FLUX_ROPE_INTERLEAVED_TAG || tag == FLUX_ROPE_NON_INTERLEAVED_TAG) {
+                    bool interleaved = (tag == FLUX_ROPE_INTERLEAVED_TAG);
+                    ggml_backend_metalium_flux_rope(ctx, node, interleaved);
+                } else {
+                    GGML_ABORT("Unsupported GGML_OP_CUSTOM (unknown userdata tag 0x%lx)", (unsigned long)tag);
+                }
+                break;
+            }
+
             case GGML_OP_NONE:
                 break;
 
@@ -3187,6 +3224,13 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
             return ggml_backend_metalium_can_pad(op);
         case GGML_OP_TIMESTEP_EMBEDDING:
             return ggml_backend_metalium_can_timestep_embedding(op);
+        case GGML_OP_CUSTOM:
+        {
+            struct ggml_custom_op_params p;
+            memcpy(&p, op->op_params, sizeof(p));
+            uintptr_t tag = (uintptr_t)p.userdata;
+            return tag == FLUX_ROPE_INTERLEAVED_TAG || tag == FLUX_ROPE_NON_INTERLEAVED_TAG;
+        }
         default:
             return false;
     }
