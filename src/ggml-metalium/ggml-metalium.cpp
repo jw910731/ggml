@@ -3425,6 +3425,12 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
             if (it != last_use.end() && it->second == i && root->op != GGML_OP_NONE) {
                 auto * root_meta = (ggml_tensor_extra_metalium*)root->extra;
                 if (root_meta && root_meta->tensor) {
+                    long refcount = root_meta->tensor.use_count();
+                    if (refcount > 1) {
+                        fmt::println(stderr, "[LEAK] op={} name={} src[{}] root_op={} root_name={} refcount={}",
+                            ggml_op_name(node->op), node->name, s,
+                            ggml_op_name(root->op), root->name, refcount);
+                    }
                     root_meta->tensor.reset();
                 }
             }
