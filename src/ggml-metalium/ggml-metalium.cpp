@@ -12,6 +12,7 @@
 #include "tt-metalium/host_buffer.hpp"
 #include "tt-metalium/memory_pin.hpp"
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
+#include "ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.hpp"
 #include "ttnn/operations/eltwise/binary/binary.hpp"
 #include "ttnn/operations/eltwise/binary/binary_composite.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
@@ -2472,6 +2473,228 @@ static void ggml_backend_metalium_pad(ggml_backend_metalium_context * ctx, struc
     };
 }
 
+static void ggml_backend_metalium_conv2d_direct(ggml_backend_metalium_context* ctx, struct ggml_tensor* dst) {
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
+
+    // src0 (kernel): GGML ne [KW, KH, IC, OC] -> TT shape [OC, IC, KH, KW] (OIHW)
+    // src1 (input) : GGML ne [IW, IH, IC, N ] -> TT shape [N,  IC, IH, IW] (NCHW)
+    // dst          : GGML ne [OW, OH, OC, N ] -> TT shape [N,  OC, OH, OW] (NCHW)
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    ggml_tensor_extra_metalium * dst_meta = (ggml_tensor_extra_metalium *)dst->extra;
+
+    const int32_t s0 = ((const int32_t *)(dst->op_params))[0]; // stride_w
+    const int32_t s1 = ((const int32_t *)(dst->op_params))[1]; // stride_h
+    const int32_t p0 = ((const int32_t *)(dst->op_params))[2]; // pad_w
+    const int32_t p1 = ((const int32_t *)(dst->op_params))[3]; // pad_h
+    const int32_t d0 = ((const int32_t *)(dst->op_params))[4]; // dilation_w
+    const int32_t d1 = ((const int32_t *)(dst->op_params))[5]; // dilation_h
+
+    const uint32_t KW = (uint32_t)src0->ne[0];
+    const uint32_t KH = (uint32_t)src0->ne[1];
+    const uint32_t IC = (uint32_t)src0->ne[2];
+    const uint32_t OC = (uint32_t)src0->ne[3];
+
+    const uint32_t IW = (uint32_t)src1->ne[0];
+    const uint32_t IH = (uint32_t)src1->ne[1];
+    const uint32_t N  = (uint32_t)src1->ne[3];
+
+    const uint32_t OW = (uint32_t)dst->ne[0];
+    const uint32_t OH = (uint32_t)dst->ne[1];
+
+    auto weight_tt = realize_ggml_view(src0);  // [OC, IC, KH, KW] TILE on device
+    auto input_tt  = realize_ggml_view(src1);  // [N, IC, IH, IW] TILE on device
+    auto device = ctx->device->get_mesh_device();
+
+    // ttnn::conv2d expects input in NHWC. Untilize first to avoid padded-dim
+    // issues when permuting the last two (tile-aligned) dimensions.
+    auto input_nhwc = ttnn::permute(*input_tt, ttsl::SmallVector<int64_t>{0, 2, 3, 1});
+
+    // Strip TILE padding from the weight AND move it to host ROW_MAJOR.
+    // Two reasons:
+    //  1. TILE layout pads KH and KW to 32; ttnn::prepare_conv_weights reads
+    //     padded_shape() when computing the matmul inner dim, so a weight
+    //     like [OC, IC, 16, 16] stored as TILE would produce
+    //     matmul_k = IC*32*32 instead of IC*KH*KW. untilize_with_unpadding
+    //     restores logical_shape == padded_shape.
+    //  2. ttnn's conv2d checks is_valid_device_conv_weights() on the
+    //     supplied weight: our raw [OC,IC,KH,KW] layout is NOT the prepared
+    //     matmul layout, so that check returns false and conv2d falls into
+    //     a per-call "pull weight back to host, re-prepare, push to device"
+    //     path (conv2d.cpp:211). For DRAM-sliced convs this fires on every
+    //     slice and has hung in practice. By pulling to host ourselves via
+    //     .cpu() and handing ttnn a host ROW_MAJOR tensor we take the clean
+    //     prepare_conv_weights_biases_and_move_to_device() path instead.
+    auto weight_host = ttnn::untilize_with_unpadding(
+        *weight_tt,
+        ttnn::Shape({OC - 1, IC - 1, KH - 1, KW - 1}),
+        std::nullopt).cpu();
+
+    // GGML weights are already [OC, IC, KH, KW] (OIHW), which matches ttnn.
+    // weight_host is host ROW_MAJOR; ttnn will prepare+upload it.
+    auto result_variant = ttnn::conv2d(
+        input_nhwc,
+        weight_host,
+        device.get(),
+        IC, OC, N, IH, IW,
+        std::array<uint32_t, 2>{KH, KW},
+        std::array<uint32_t, 2>{(uint32_t)s1, (uint32_t)s0},
+        std::array<uint32_t, 2>{(uint32_t)p1, (uint32_t)p0},
+        std::array<uint32_t, 2>{(uint32_t)d1, (uint32_t)d0},
+        /*groups=*/1u,
+        /*dtype*/ std::nullopt,
+        /*bias_tensor*/ std::nullopt,
+        /*conv_config_*/ std::optional<ttnn::prim::Conv2dConfig>{ttnn::prim::Conv2dConfig{
+            // Performance Improve
+            .deallocate_activation  = true,
+            .reallocate_halo_output = true,
+
+            .config_tensors_in_dram = true,
+            // Pin BLOCK_SHARDED so weight prep goes through
+            // to_weight_tile_layout_block_sharded, which has no inner-dim
+            // assertion. Auto-shard may pick HEIGHT_SHARDED whose weight-prep
+            // path (to_weight_special_padding_tile_layout) asserts
+            // weight_block_h_ntiles*32 >= IC_padded*KW and crashes on
+            // small-IC convs.
+            .shard_layout = std::nullopt,
+            // Leave full_inner_dim=false (default). With full_inner_dim=true
+            // each core stages the whole KH*KW*IC_padded inner dim in its
+            // activation CB, which overflows L1 for kernels like 16x16 with
+            // IC padded from 3 to 32 (act_block_w_ntiles=256, ~1MB act CB).
+            // Disable kernel-stride folding: when enabled, conv2d_DRAM folds the
+            // input tensor in place (kernel 16x16 stride 16 -> kernel 1x1, IC*=256)
+            // and then invokes conv2d_L1 with the folded params but the unfolded
+            // weight. conv2d_L1 cannot re-fold the weight (orig_stride becomes
+            // [1,1] after the fold), so the weight tiler reads mismatched
+            // dimensions and produces a weight with padded_shape[-2]=65536.
+            .enable_kernel_stride_folding = false,
+        }},
+        /*compute_config_*/ std::nullopt,
+        /*memory_config_*/ std::nullopt,
+        /*dram_slice_config_*/ std::nullopt);
+    auto output = std::get<ttnn::Tensor>(result_variant);
+
+    // Output comes back flattened as [1, 1, N*OH*OW, OC] — reshape and permute
+    // back to GGML's NCHW convention.
+    output = ttnn::reshape(output, ttnn::Shape({N, OH, OW, OC}));
+    output = ttnn::permute(output, ttsl::SmallVector<int64_t>{0, 3, 1, 2});
+
+    if (output.layout() != tt::tt_metal::Layout::TILE) {
+        output = ttnn::tilize_with_zero_padding(output);
+    }
+    tt::tt_metal::DataType final_type = ggml2tt_type(dst->type, device->arch());
+    if (output.dtype() != final_type) {
+        output = ttnn::typecast(output, final_type);
+    }
+
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(output)),
+    };
+}
+
+static void ggml_backend_metalium_im2col(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
+    GGML_UNUSED(ctx);
+
+    const struct ggml_tensor * src0 = dst->src[0]; // kernel (shape only)
+    const struct ggml_tensor * src1 = dst->src[1]; // image (data)
+    ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
+
+    const int32_t s0    = ((const int32_t *)(dst->op_params))[0];
+    const int32_t s1    = ((const int32_t *)(dst->op_params))[1];
+    const int32_t p0    = ((const int32_t *)(dst->op_params))[2];
+    const int32_t p1    = ((const int32_t *)(dst->op_params))[3];
+    const int32_t d0    = ((const int32_t *)(dst->op_params))[4];
+    const int32_t d1    = ((const int32_t *)(dst->op_params))[5];
+    const bool    is_2D = ((const int32_t *)(dst->op_params))[6] == 1;
+
+    // src0 (kernel) ne: [KW, KH, IC, OC] for 2D; [KW, IC, OC, 1] for 1D
+    // src1 (image)  ne: [IW, IH, IC, N]  for 2D; [IW, IC, N, 1]  for 1D
+    const int64_t KW = src0->ne[0];
+    const int64_t KH = is_2D ? src0->ne[1] : 1;
+    const int64_t IC = is_2D ? src0->ne[2] : src0->ne[1];
+
+    const int64_t IW = src1->ne[0];
+    const int64_t IH = is_2D ? src1->ne[1] : 1;
+    const int64_t N  = is_2D ? src1->ne[3] : src1->ne[2];
+
+    // dst ne: [IC*KH*KW, OW, OH, N] for 2D; [IC*KW, OW, N, 1] for 1D
+    const int64_t OW = dst->ne[1];
+    const int64_t OH = is_2D ? dst->ne[2] : 1;
+
+    // CPU host roundtrip: read input from device, compute im2col on CPU, write back
+    auto src1_tt = realize_ggml_view(src1);
+    const size_t src1_nelems = ggml_nelements(src1);
+    std::vector<float> src1_data(src1_nelems);
+
+    if (src1_tt->dtype() == tt::tt_metal::DataType::BFLOAT16) {
+        copy_tt_tensor_to_host_pointer<bfloat16>(*src1_tt, src1_data.data(), GGML_TYPE_F32);
+    } else {
+        copy_tt_tensor_to_host_pointer<float>(*src1_tt, src1_data.data(), GGML_TYPE_F32);
+    }
+
+    const size_t dst_nelems = ggml_nelements(dst);
+    std::vector<float> dst_data(dst_nelems, 0.0f);
+
+    if (is_2D) {
+        const int64_t IC_KH_KW = IC * KH * KW;
+        for (int64_t in = 0; in < N; in++) {
+            for (int64_t ioh = 0; ioh < OH; ioh++) {
+                for (int64_t iow = 0; iow < OW; iow++) {
+                    for (int64_t iic = 0; iic < IC; iic++) {
+                        for (int64_t ikh = 0; ikh < KH; ikh++) {
+                            for (int64_t ikw = 0; ikw < KW; ikw++) {
+                                const int64_t iiw = iow * s0 + ikw * d0 - p0;
+                                const int64_t iih = ioh * s1 + ikh * d1 - p1;
+                                if (iiw >= 0 && iiw < IW && iih >= 0 && iih < IH) {
+                                    dst_data[in*OH*OW*IC_KH_KW + ioh*OW*IC_KH_KW + iow*IC_KH_KW + iic*KH*KW + ikh*KW + ikw]
+                                        = src1_data[in*IC*IH*IW + iic*IH*IW + iih*IW + iiw];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        const int64_t IC_KW = IC * KW;
+        for (int64_t in = 0; in < N; in++) {
+            for (int64_t iow = 0; iow < OW; iow++) {
+                for (int64_t iic = 0; iic < IC; iic++) {
+                    for (int64_t ikw = 0; ikw < KW; ikw++) {
+                        const int64_t iiw = iow * s0 + ikw * d0 - p0;
+                        if (iiw >= 0 && iiw < IW) {
+                            dst_data[in*OW*IC_KW + iow*IC_KW + iic*KW + ikw]
+                                = src1_data[in*IC*IW + iic*IW + iiw];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    auto storage = host_data_to_tt_host_buffer<float, bfloat16>(dst_data.data(), dst_nelems);
+
+    ttsl::SmallVector<uint32_t> shape(GGML_MAX_DIMS, 1);
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        shape[i] = dst->ne[GGML_MAX_DIMS - i - 1];
+    }
+
+    tt::tt_metal::Tensor t(std::move(storage), ttnn::Shape(shape),
+        tt::tt_metal::DataType::BFLOAT16, tt::tt_metal::Layout::ROW_MAJOR);
+
+    auto* device = src1_tt->device();
+    tt::tt_metal::DataType final_type = ggml2tt_type(dst->type, device->arch());
+    t = ttnn::tilize_with_zero_padding(t.to_device(device), std::nullopt, final_type);
+
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t)),
+    };
+}
+
 // backend interface
 
 static const char * ggml_backend_metalium_name(ggml_backend_t backend) {
@@ -3071,6 +3294,14 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
                 ggml_backend_metalium_pad(ctx, node);
                 break;
 
+            case GGML_OP_IM2COL:
+                ggml_backend_metalium_im2col(ctx, node);
+                break;
+
+            case GGML_OP_CONV_2D:
+                ggml_backend_metalium_conv2d_direct(ctx, node);
+                break;
+
             case GGML_OP_TIMESTEP_EMBEDDING:
                 ggml_backend_metalium_timestep_embedding(ctx, node);
                 break;
@@ -3299,6 +3530,24 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
             return tensor_supported(src1) && ggml_backend_metalium_can_set_rows(op);
         case GGML_OP_PAD:
             return ggml_backend_metalium_can_pad(op);
+        case GGML_OP_IM2COL:
+            return tensor_supported(src1);
+        case GGML_OP_CONV_2D:
+        {
+            // Reject 1×1 convs — the matmul path has L1 issues for large IC.
+            // 1×1 convs fall back cheaply (IM2COL is just reshape for 1×1).
+            const int64_t KW = src0->ne[0];
+            const int64_t KH = src0->ne[1];
+            if (KW == 1 && KH == 1) return false;
+            return tensor_supported(src1);
+        }
+        case GGML_OP_UPSCALE:
+        {
+            // Only support nearest mode for now
+            const int32_t mode_flags = ((const int32_t *)(op->op_params))[0];
+            const int mode = mode_flags & 0xFF;
+            return mode == GGML_SCALE_MODE_NEAREST;
+        }
         case GGML_OP_TIMESTEP_EMBEDDING:
             return ggml_backend_metalium_can_timestep_embedding(op);
         case GGML_OP_CUSTOM:

@@ -70,6 +70,7 @@
 #include <ttnn/cpp/ttnn/operations/transformer/sdpa/sdpa.hpp>
 #include <ttnn/cpp/ttnn/operations/transformer/sdpa_decode/sdpa_decode.hpp>
 #include <ttnn/operations/data_movement/copy/copy.hpp>
+#include <ttnn/operations/conv/conv2d/conv2d.hpp>
 
 
 #include <memory>

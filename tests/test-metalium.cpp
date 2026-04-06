@@ -944,6 +944,66 @@ static void add_unittests(std::vector<std::unique_ptr<test_case>>& tests)
     }, "MLP mixer", 1e-3));
 }
 
+static void add_im2col_tests(std::vector<std::unique_ptr<test_case>>& tests)
+{
+    // Helper to create a 2D im2col test
+    auto make_im2col_2d_test = [&](int64_t IC, int64_t IH, int64_t IW, int64_t OC,
+                                    int64_t KH, int64_t KW, int64_t N,
+                                    int s0, int s1, int p0, int p1, int d0, int d1,
+                                    const char* name) {
+        tests.push_back(make_test([=](ggml_context* ctx) {
+            // src0 (kernel): ne [KW, KH, IC, OC]
+            ggml_tensor* kernel = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, KW, KH, IC, OC);
+            // src1 (image): ne [IW, IH, IC, N]
+            ggml_tensor* image  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, IW, IH, IC, N);
+            return ggml_im2col(ctx, kernel, image, s0, s1, p0, p1, d0, d1, true, GGML_TYPE_F32);
+        }, name, 1e-3));
+    };
+
+    // Basic 3x3 conv, stride 1, padding 1 (most common in SD VAE)
+    make_im2col_2d_test(3, 8, 8, 16, 3, 3, 1,  1, 1, 1, 1, 1, 1,
+        "IM2COL 2D 3x3 s1 p1 IC=3 8x8 N=1");
+
+    // 3x3 conv, stride 1, no padding
+    make_im2col_2d_test(16, 16, 16, 32, 3, 3, 1,  1, 1, 0, 0, 1, 1,
+        "IM2COL 2D 3x3 s1 p0 IC=16 16x16 N=1");
+
+    // 3x3 conv, stride 2, padding 1 (downsampling)
+    make_im2col_2d_test(32, 32, 32, 64, 3, 3, 1,  2, 2, 1, 1, 1, 1,
+        "IM2COL 2D 3x3 s2 p1 IC=32 32x32 N=1");
+
+    // 1x1 conv (pointwise)
+    make_im2col_2d_test(64, 16, 16, 128, 1, 1, 1,  1, 1, 0, 0, 1, 1,
+        "IM2COL 2D 1x1 s1 p0 IC=64 16x16 N=1");
+
+    // Batch > 1
+    make_im2col_2d_test(3, 8, 8, 16, 3, 3, 4,  1, 1, 1, 1, 1, 1,
+        "IM2COL 2D 3x3 s1 p1 IC=3 8x8 N=4");
+
+    // Non tile-aligned dimensions
+    make_im2col_2d_test(5, 13, 17, 7, 3, 3, 2,  1, 1, 1, 1, 1, 1,
+        "IM2COL 2D 3x3 s1 p1 IC=5 17x13 N=2 (non tile-aligned)");
+
+    // Dilation > 1
+    make_im2col_2d_test(8, 16, 16, 16, 3, 3, 1,  1, 1, 2, 2, 2, 2,
+        "IM2COL 2D 3x3 s1 p2 d2 IC=8 16x16 N=1 (dilated)");
+
+    // Patch embedding style (large kernel, stride = kernel size)
+    make_im2col_2d_test(3, 32, 32, 768, 16, 16, 1,  16, 16, 0, 0, 1, 1,
+        "IM2COL 2D 16x16 s16 p0 IC=3 32x32 N=1 (patch embed)");
+
+
+    // 1D im2col test
+    tests.push_back(make_test([](ggml_context* ctx) {
+        const int64_t KW = 3, IC = 8, OC = 16, IW = 32, N = 2;
+        // src0 (kernel): ne [KW, IC, OC, 1]
+        ggml_tensor* kernel = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, KW, IC, OC);
+        // src1 (image): ne [IW, IC, N, 1]
+        ggml_tensor* image  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, IW, IC, N);
+        return ggml_im2col(ctx, kernel, image, 1, 0, 1, 0, 1, 0, false, GGML_TYPE_F32);
+    }, "IM2COL 1D KW=3 s1 p1 IC=8 IW=32 N=2", 1e-3));
+}
+
 static void add_group_norm_tests(std::vector<std::unique_ptr<test_case>>& tests)
 {
     auto make_gn_test = [&](int64_t W, int64_t H, int64_t C, int64_t N,
@@ -986,6 +1046,63 @@ static void add_group_norm_tests(std::vector<std::unique_ptr<test_case>>& tests)
     }, "GroupNorm 32x32 C=32 G=32 N=1 (cache reuse)", 1e-2));
 }
 
+
+static void add_conv2d_direct_tests(std::vector<std::unique_ptr<test_case>>& tests)
+{
+    // Helper to create a conv2d direct test
+    // kernel: [KW, KH, IC, OC], input: [IW, IH, IC, N]
+    auto make_conv2d_test = [&](int64_t IC, int64_t IH, int64_t IW, int64_t OC,
+                                int64_t KH, int64_t KW, int64_t N,
+                                int s0, int s1, int p0, int p1, int d0, int d1,
+                                const char* name, float max_err = 1e-2) {
+        tests.push_back(make_test([=](ggml_context* ctx) {
+            ggml_tensor* kernel = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, KW, KH, IC, OC);
+            ggml_tensor* image  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, IW, IH, IC, N);
+            return ggml_conv_2d_direct(ctx, kernel, image, s0, s1, p0, p1, d0, d1);
+        }, name, max_err));
+    };
+
+    // Basic 3x3 conv, stride 1, padding 1
+    make_conv2d_test(3, 8, 8, 16, 3, 3, 1,  1, 1, 1, 1, 1, 1,
+        "CONV_2D 3x3 s1 p1 IC=3 8x8 N=1");
+
+    // 3x3 conv, stride 1, no padding
+    make_conv2d_test(16, 16, 16, 32, 3, 3, 1,  1, 1, 0, 0, 1, 1,
+        "CONV_2D 3x3 s1 p0 IC=16 16x16 N=1");
+
+    // 3x3 conv, stride 2, padding 1 (downsampling)
+    make_conv2d_test(32, 32, 32, 64, 3, 3, 1,  2, 2, 1, 1, 1, 1,
+        "CONV_2D 3x3 s2 p1 IC=32 32x32 N=1");
+
+    // 1x1 conv (pointwise)
+    make_conv2d_test(64, 16, 16, 128, 1, 1, 1,  1, 1, 0, 0, 1, 1,
+        "CONV_2D 1x1 s1 p0 IC=64 16x16 N=1");
+
+    // Batch > 1
+    make_conv2d_test(3, 8, 8, 16, 3, 3, 4,  1, 1, 1, 1, 1, 1,
+        "CONV_2D 3x3 s1 p1 IC=3 8x8 N=4");
+
+    // Non tile-aligned dimensions
+    make_conv2d_test(5, 13, 17, 7, 3, 3, 2,  1, 1, 1, 1, 1, 1,
+        "CONV_2D 3x3 s1 p1 IC=5 17x13 N=2 (non tile-aligned)");
+
+    // Dilation > 1
+    make_conv2d_test(8, 16, 16, 16, 3, 3, 1,  1, 1, 2, 2, 2, 2,
+        "CONV_2D 3x3 s1 p2 d2 IC=8 16x16 N=1 (dilated)");
+
+    // Patch embedding style (large kernel, stride = kernel size)
+    make_conv2d_test(3, 32, 32, 768, 16, 16, 1,  16, 16, 0, 0, 1, 1,
+        "CONV_2D 16x16 s16 p0 IC=3 32x32 N=1 (patch embed)");
+
+    // SD VAE typical: 3x3 s1 p1 over 128-channel 64x64
+    make_conv2d_test(128, 64, 64, 128, 3, 3, 1,  1, 1, 1, 1, 1, 1,
+        "CONV_2D 3x3 s1 p1 IC=128 64x64 N=1 (SD VAE)");
+
+    // Small spatial, many channels (bottleneck)
+    make_conv2d_test(256, 8, 8, 256, 3, 3, 1,  1, 1, 1, 1, 1, 1,
+        "CONV_2D 3x3 s1 p1 IC=256 8x8 N=1 (bottleneck)");
+}
+
 int main(int argc, char ** argv)
 {
     (void)argc;
@@ -1006,7 +1123,9 @@ int main(int argc, char ** argv)
     std::vector<std::unique_ptr<test_case>> tests;
     add_unittests(tests);
     add_flux_rope_tests(tests);
+    add_im2col_tests(tests);
     add_group_norm_tests(tests);
+    add_conv2d_direct_tests(tests);
 
     ///////////////// put experiment code here /////////////////
     // easier on the eye to find it (also one line to disable UT)
