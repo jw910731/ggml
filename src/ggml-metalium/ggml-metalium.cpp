@@ -1775,11 +1775,23 @@ static void ggml_backend_metalium_group_norm(ggml_backend_metalium_context * ctx
         input = ttnn::tilize_with_zero_padding(input);
     }
 
-    // Create input mask (host tensor → device)
-    auto input_mask = ttnn::operations::normalization::create_group_norm_input_mask(
-        C, n_groups, /*num_cores_across_channel=*/1, tt::tt_metal::DataType::BFLOAT16);
-    input_mask = input_mask.to_device(device);
-    input_mask = ttnn::tilize_with_zero_padding(input_mask);
+    // Determine valid CoreGrid for group_norm.
+    // For DRAM (interleaved) tensors, the program factory computes:
+    //   num_virtual_cols = min(grid_x, num_groups), reduced until
+    //     (C / num_virtual_cols) % 32 == 0 AND num_groups % num_virtual_cols == 0
+    //   num_virtual_rows = (grid_x / num_virtual_cols) * grid_y
+    //   Constraint: H*W >= num_virtual_rows
+    auto max_grid = device->compute_with_storage_grid_size();
+    int grid_x = std::min((int)max_grid.x, n_groups);
+    while (grid_x > 0) {
+        if ((C / grid_x) % 32 == 0 && n_groups % grid_x == 0)
+            break;
+        grid_x--;
+    }
+    GGML_ASSERT(grid_x > 0 && "No valid grid_x for group_norm");
+    // grid_y: H*W is always much larger than max_grid.y, so use full grid
+    int grid_y = (int)max_grid.y;
+    auto core_grid = ttnn::CoreGrid{(size_t)grid_x, (size_t)grid_y};
 
     // Create gamma (ones) and beta (zeros) in ROW_MAJOR [1, 1, C/32, 32]
     uint32_t tiles_per_core = (uint32_t)(C / 32);
@@ -1791,27 +1803,24 @@ static void ggml_backend_metalium_group_norm(ggml_backend_metalium_context * ctx
         tt::tt_metal::DataType::BFLOAT16, tt::tt_metal::Layout::ROW_MAJOR, std::nullopt, std::nullopt);
     beta = beta.to_device(device);
 
-    // Compute num_out_blocks to keep per-block L1 usage within limits (~1.5MB L1)
-    // Each block processes (H*W / num_out_blocks) spatial elements across C channels
-    // Working set ≈ (HW/blocks) * C * 2bytes * ~3 buffers
-    const int64_t HW = H * W;
-    int num_out_blocks = std::max((int64_t)1, (HW * C * 6) / (1024 * 1024));
-
     // Call ttnn::group_norm
+    // Pass std::nullopt for input_mask — group_norm auto-generates it from core_grid.
+    // Pass -1 for num_out_blocks to trigger the internal heuristic
+    // (program factory auto-sizes based on grid and tensor dims).
     auto result = ttnn::group_norm(
         input,
         n_groups,
         eps,
-        input_mask,       // input_mask
+        std::nullopt,     // input_mask (auto-generated from core_grid)
         gamma,            // weight
         beta,             // bias
         std::nullopt,     // reciprocals
         std::nullopt,     // memory_config
         std::nullopt,     // dtype
-        ttnn::CoreGrid{1, 1},  // core_grid
+        core_grid,        // core_grid
         false,            // inplace (must be false for TILE input)
         tt::tt_metal::Layout::TILE,  // output_layout
-        num_out_blocks,   // num_out_blocks
+        std::optional<int>{-1},  // num_out_blocks (-1 = use heuristic)
         std::nullopt,     // compute_kernel_config
         std::nullopt,     // negative_mask
         false);           // use_welford
@@ -2383,7 +2392,7 @@ static void ggml_backend_metalium_timestep_embedding(ggml_backend_metalium_conte
 
     // If dim is odd, pad one zero at the end of the last dimension
     if (dim % 2 != 0) {
-        ttnn::SmallVector<std::array<uint32_t, 2>> padding = {{0, 0}, {0, 0}, {0, 0}, {0, 1}};
+        ttsl::SmallVector<std::array<uint32_t, 2>> padding = {{0, 0}, {0, 0}, {0, 0}, {0, 1}};
         result = ttnn::pad(result, padding, 0.0f);
     }
 
