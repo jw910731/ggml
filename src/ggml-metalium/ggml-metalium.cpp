@@ -2473,6 +2473,79 @@ static void ggml_backend_metalium_pad(ggml_backend_metalium_context * ctx, struc
     };
 }
 
+static void ggml_backend_metalium_upscale(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    GGML_UNUSED(ctx);
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
+
+    auto src_tt = realize_ggml_view(src0);
+    auto* device = src_tt->device();
+
+    // Read source data to host as float
+    const size_t src_nelems = ggml_nelements(src0);
+    std::vector<float> src_data(src_nelems);
+
+    if (src_tt->dtype() == tt::tt_metal::DataType::BFLOAT16) {
+        copy_tt_tensor_to_host_pointer<bfloat16>(*src_tt, src_data.data(), GGML_TYPE_F32);
+    } else {
+        copy_tt_tensor_to_host_pointer<float>(*src_tt, src_data.data(), GGML_TYPE_F32);
+    }
+
+    // Nearest-neighbor upscale on CPU
+    // Scale factors per GGML dimension: ne[0]=W, ne[1]=H, ne[2]=C, ne[3]=N
+    const float sf0 = (float)dst->ne[0] / (float)src0->ne[0];
+    const float sf1 = (float)dst->ne[1] / (float)src0->ne[1];
+    const float sf2 = (float)dst->ne[2] / (float)src0->ne[2];
+    const float sf3 = (float)dst->ne[3] / (float)src0->ne[3];
+
+    const size_t dst_nelems = ggml_nelements(dst);
+    std::vector<float> dst_data(dst_nelems);
+
+    for (int64_t i3 = 0; i3 < dst->ne[3]; i3++) {
+        const int64_t i03 = (int64_t)((float)i3 / sf3);
+        for (int64_t i2 = 0; i2 < dst->ne[2]; i2++) {
+            const int64_t i02 = (int64_t)((float)i2 / sf2);
+            for (int64_t i1 = 0; i1 < dst->ne[1]; i1++) {
+                const int64_t i01 = (int64_t)((float)i1 / sf1);
+                for (int64_t i0 = 0; i0 < dst->ne[0]; i0++) {
+                    const int64_t i00 = (int64_t)((float)i0 / sf0);
+
+                    const int64_t src_idx = i03 * src0->ne[2] * src0->ne[1] * src0->ne[0]
+                                          + i02 * src0->ne[1] * src0->ne[0]
+                                          + i01 * src0->ne[0]
+                                          + i00;
+                    const int64_t dst_idx = i3 * dst->ne[2] * dst->ne[1] * dst->ne[0]
+                                          + i2 * dst->ne[1] * dst->ne[0]
+                                          + i1 * dst->ne[0]
+                                          + i0;
+                    dst_data[dst_idx] = src_data[src_idx];
+                }
+            }
+        }
+    }
+
+    // Create output TT tensor and send to device
+    auto storage = host_data_to_tt_host_buffer<float, bfloat16>(dst_data.data(), dst_nelems);
+
+    ttsl::SmallVector<uint32_t> shape(GGML_MAX_DIMS, 1);
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        shape[i] = dst->ne[GGML_MAX_DIMS - i - 1];
+    }
+
+    tt::tt_metal::Tensor t(std::move(storage), ttnn::Shape(shape),
+        tt::tt_metal::DataType::BFLOAT16, tt::tt_metal::Layout::ROW_MAJOR);
+
+    tt::tt_metal::DataType final_type = ggml2tt_type(dst->type, device->arch());
+    t = ttnn::tilize_with_zero_padding(t.to_device(device), std::nullopt, final_type);
+
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t)),
+    };
+}
+
 static void ggml_backend_metalium_conv2d_direct(ggml_backend_metalium_context* ctx, struct ggml_tensor* dst) {
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
@@ -3300,6 +3373,10 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
 
             case GGML_OP_CONV_2D:
                 ggml_backend_metalium_conv2d_direct(ctx, node);
+                break;
+
+            case GGML_OP_UPSCALE:
+                ggml_backend_metalium_upscale(ctx, node);
                 break;
 
             case GGML_OP_TIMESTEP_EMBEDDING:

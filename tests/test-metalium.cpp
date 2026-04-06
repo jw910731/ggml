@@ -1046,6 +1046,31 @@ static void add_group_norm_tests(std::vector<std::unique_ptr<test_case>>& tests)
     }, "GroupNorm 32x32 C=32 G=32 N=1 (cache reuse)", 1e-2));
 }
 
+static void add_upscale_tests(std::vector<std::unique_ptr<test_case>>& tests)
+{
+    auto make_upscale_test = [&](int64_t W, int64_t H, int64_t C, int64_t N,
+                                  int scale_factor, const char* name) {
+        tests.push_back(make_test([=](ggml_context* ctx) {
+            ggml_tensor* input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, W, H, C, N);
+            return ggml_upscale(ctx, input, scale_factor, GGML_SCALE_MODE_NEAREST);
+        }, name, 1e-3));
+    };
+
+    // Basic 2x upscale (most common in SD VAE)
+    make_upscale_test(32, 32, 32, 1, 2, "Upscale 2x 32x32 C=32 N=1");
+    make_upscale_test(64, 64, 128, 1, 2, "Upscale 2x 64x64 C=128 N=1 (SD VAE)");
+    make_upscale_test(16, 16, 256, 1, 2, "Upscale 2x 16x16 C=256 N=1");
+    make_upscale_test(32, 32, 64, 2, 2, "Upscale 2x 32x32 C=64 N=2 (batch)");
+
+    // Non-tile-aligned dimensions
+    make_upscale_test(13, 17, 32, 1, 2, "Upscale 2x 13x17 C=32 N=1 (non tile-aligned)");
+
+    // 4x upscale
+    make_upscale_test(16, 16, 32, 1, 4, "Upscale 4x 16x16 C=32 N=1");
+
+    // Small dimensions
+    make_upscale_test(8, 8, 3, 1, 2, "Upscale 2x 8x8 C=3 N=1 (small)");
+}
 
 static void add_conv2d_direct_tests(std::vector<std::unique_ptr<test_case>>& tests)
 {
@@ -1125,6 +1150,7 @@ int main(int argc, char ** argv)
     add_flux_rope_tests(tests);
     add_im2col_tests(tests);
     add_group_norm_tests(tests);
+    add_upscale_tests(tests);
     add_conv2d_direct_tests(tests);
 
     ///////////////// put experiment code here /////////////////
