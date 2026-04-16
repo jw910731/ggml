@@ -2581,6 +2581,36 @@ static void ggml_backend_metalium_conv2d_direct(ggml_backend_metalium_context* c
     auto input_tt  = realize_ggml_view(src1);  // [N, IC, IH, IW] TILE on device
     auto device = ctx->device->get_mesh_device();
 
+    // 1x1 conv with stride 1 and no padding is a pointwise linear transform.
+    // Implement as matmul to avoid ttnn::conv2d issues with zero-padding configs.
+    if (KH == 1 && KW == 1 && s0 == 1 && s1 == 1 && p0 == 0 && p1 == 0) {
+        // input:  [N, IC, IH, IW] -> reshape to [N*IH*IW, IC]
+        // weight: [OC, IC, 1, 1]  -> reshape to [IC, OC]
+        // matmul: [N*IH*IW, IC] x [IC, OC] -> [N*IH*IW, OC]
+        // reshape back to [N, OC, OH, OW]
+        auto input_2d = ttnn::reshape(*input_tt, ttnn::Shape({N * IH * IW, IC}));
+        auto weight_2d = ttnn::reshape(*weight_tt, ttnn::Shape({OC, IC}));
+        weight_2d = ttnn::permute(weight_2d, ttsl::SmallVector<int64_t>{1, 0}); // [IC, OC]
+
+        auto output = ttnn::matmul(input_2d, weight_2d);
+        // output: [N*IH*IW, OC] -> [N, OC, OH, OW]
+        output = ttnn::reshape(output, ttnn::Shape({N, IH, IW, OC}));
+        output = ttnn::permute(output, ttsl::SmallVector<int64_t>{0, 3, 1, 2});
+
+        if (output.layout() != tt::tt_metal::Layout::TILE) {
+            output = ttnn::tilize_with_zero_padding(output);
+        }
+        tt::tt_metal::DataType final_type = ggml2tt_type(dst->type, device->arch());
+        if (output.dtype() != final_type) {
+            output = ttnn::typecast(output, final_type);
+        }
+
+        *dst_meta = {
+            .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(output)),
+        };
+        return;
+    }
+
     // ttnn::conv2d expects input in NHWC. Untilize first to avoid padded-dim
     // issues when permuting the last two (tile-aligned) dimensions.
     auto input_nhwc = ttnn::permute(*input_tt, ttsl::SmallVector<int64_t>{0, 2, 3, 1});
@@ -3616,14 +3646,7 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
         case GGML_OP_IM2COL:
             return tensor_supported(src1);
         case GGML_OP_CONV_2D:
-        {
-            // Reject 1×1 convs — the matmul path has L1 issues for large IC.
-            // 1×1 convs fall back cheaply (IM2COL is just reshape for 1×1).
-            const int64_t KW = src0->ne[0];
-            const int64_t KH = src0->ne[1];
-            if (KW == 1 && KH == 1) return false;
             return tensor_supported(src1);
-        }
         case GGML_OP_UPSCALE:
         {
             // Only support nearest mode for now
