@@ -3,7 +3,6 @@
 #include <tuple>
 #include <variant>
 
-#include <ttnn/decorators.hpp>
 #include <ttnn/device_operation.hpp>
 #include <ttnn/tensor/tensor.hpp>
 #include <ttnn/tensor/types.hpp>
@@ -90,17 +89,9 @@ struct MulMatDeviceOperation {
 } // namespace mul_mat_device
 
 namespace prim {
-constexpr auto mul_mat =
-    ttnn::register_operation<"ttggml::prim::mul_mat", ttggml::mul_mat_device::MulMatDeviceOperation>();
+ttnn::Tensor mul_mat(const Tensor& a, const Tensor& b, bool high_percision);
 } // namespace prim
 
-struct MulMatOperation {
-    static ttnn::Tensor invoke(const Tensor& a, const Tensor& b, bool high_percision = false);
-};
-
-/**
- * Implements GGML's MUL_MAT operation which computes b @ aT
- */
-constexpr auto mul_mat = ttnn::register_operation<"ttggml::mul_mat", ttggml::MulMatOperation>();
+ttnn::Tensor mul_mat(const Tensor& a, const Tensor& b, bool high_percision = false);
 
 } // namespace ttggml

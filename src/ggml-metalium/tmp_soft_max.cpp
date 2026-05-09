@@ -237,13 +237,20 @@ void soft_max_device::program::SoftMaxProgramFactory::override_runtime_arguments
     }
 }
 
-// ---- SoftMaxOperation (outer wrapper) ----
+// ---- prim::soft_max ----
 
-ttnn::Tensor SoftMaxOperation::invoke(const Tensor& a, float scale) {
+ttnn::Tensor prim::soft_max(const Tensor& input, std::optional<Tensor> mask, float scale) {
+    auto [attrs, args] = soft_max_device::SoftMaxDeviceOperation::invoke(input, std::move(mask), scale);
+    return ttnn::device_operation::detail::launch<soft_max_device::SoftMaxDeviceOperation>(attrs, args);
+}
+
+// ---- soft_max ----
+
+ttnn::Tensor soft_max(const Tensor& a, float scale) {
     return ttggml::prim::soft_max(a, std::nullopt, scale);
 }
 
-ttnn::Tensor SoftMaxOperation::invoke(const Tensor& a, const Tensor& mask, float scale) {
+ttnn::Tensor soft_max(const Tensor& a, const Tensor& mask, float scale) {
     return ttggml::prim::soft_max(a, mask, scale);
 }
 

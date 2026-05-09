@@ -12,13 +12,20 @@
 #ifdef TRISC_MATH
 using namespace sfpi;
 
+sfpi_inline vFloat sfpu_sinpi(vFloat x) {
+    vFloat xx = x * x;
+
+    return x *
+           ((((0x1.406628p-4f * xx - 0x9.93f86p-4f) * xx + 0x2.8cd64p+0f) * xx - 0x5.2aef6p+0f) * xx + 0x3.243f6cp+0f);
+}
+
 inline vFloat vector_sin_phase(vFloat x)
 {
     vFloat v = x;
-    vInt whole_v = float_to_int16(v, 0);
-    v -= int32_to_float(whole_v, 0);
+    vInt whole_v = float_to_int16(v, RoundMode::NearestEven);
+    v -= int32_to_float(whole_v, RoundMode::NearestEven);
 
-    v = ckernel::sfpu::sfpu_sinpi<false>(v);
+    v = sfpu_sinpi(v);
     v_if(whole_v & 1) { v = -v; }
     v_endif;
     return v;
@@ -125,7 +132,7 @@ inline void rope_tile(int pos, int D, int vec_offset)
         vFloat exponent = block_lane_id * vConstFloatPrgm2;
 
         vFloat term_to_exp = -exponent * vConstFloatPrgm0 - vConstFloatPrgm1;
-        vFloat freq = sfpu::_sfpu_exp_f32_accurate_(term_to_exp);
+        vFloat freq = sfpu::_sfpu_exp_fp32_accurate_(term_to_exp);
         #ifdef HAS_FREQ_FACTOR
             int ff_idx = 96+((vec_offset/32)%2)*8+i;
             freq = freq * vFloat(dst_reg[ff_idx]);
@@ -175,8 +182,7 @@ inline void rope_tile_init(float inv_d)
 }
 #endif
 
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
 
     uint32_t n_tiles_width_active = get_arg_val<uint32_t>(0);
     uint32_t n_tiles_width = get_arg_val<uint32_t>(1);
@@ -249,5 +255,4 @@ void MAIN {
     }
     #endif
 
-}
 }

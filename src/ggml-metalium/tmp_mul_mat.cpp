@@ -212,9 +212,16 @@ void mul_mat_device::program::MulMatProgramFactory::override_runtime_arguments(
     }
 }
 
-// ---- MulMatOperation (outer wrapper) ----
+// ---- prim::mul_mat ----
 
-ttnn::Tensor MulMatOperation::invoke(const Tensor& a, const Tensor& b, bool high_percision) {
+ttnn::Tensor prim::mul_mat(const Tensor& a, const Tensor& b, bool high_percision) {
+    auto [attrs, args] = mul_mat_device::MulMatDeviceOperation::invoke(a, b, high_percision);
+    return ttnn::device_operation::detail::launch<mul_mat_device::MulMatDeviceOperation>(attrs, args);
+}
+
+// ---- mul_mat ----
+
+ttnn::Tensor mul_mat(const Tensor& a, const Tensor& b, bool high_percision) {
     return ttggml::prim::mul_mat(a, b, high_percision);
 }
 

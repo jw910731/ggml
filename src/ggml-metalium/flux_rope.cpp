@@ -250,9 +250,16 @@ void flux_rope_device::program::FluxRoPEProgramFactory::override_runtime_argumen
     }
 }
 
-// ---- FluxRoPEOperation (outer wrapper) ----
+// ---- prim::flux_rope ----
 
-ttnn::Tensor FluxRoPEOperation::invoke(
+ttnn::Tensor prim::flux_rope(const Tensor& src, const Tensor& pe, bool rope_interleaved) {
+    auto [attrs, args] = flux_rope_device::FluxRoPEDeviceOperation::invoke(src, pe, rope_interleaved);
+    return ttnn::device_operation::detail::launch<flux_rope_device::FluxRoPEDeviceOperation>(attrs, args);
+}
+
+// ---- flux_rope ----
+
+ttnn::Tensor flux_rope(
     const Tensor& src_tensor, const Tensor& pe_tensor, bool rope_interleaved)
 {
     return ttggml::prim::flux_rope(src_tensor, pe_tensor, rope_interleaved);

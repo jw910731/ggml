@@ -4,7 +4,6 @@
 #include <tuple>
 #include <variant>
 
-#include <ttnn/decorators.hpp>
 #include <ttnn/device_operation.hpp>
 #include <ttnn/tensor/tensor.hpp>
 #include <ttnn/tensor/types.hpp>
@@ -91,15 +90,10 @@ struct SoftMaxDeviceOperation {
 } // namespace soft_max_device
 
 namespace prim {
-constexpr auto soft_max =
-    ttnn::register_operation<"ttggml::prim::soft_max", ttggml::soft_max_device::SoftMaxDeviceOperation>();
+ttnn::Tensor soft_max(const Tensor& input, std::optional<Tensor> mask, float scale);
 } // namespace prim
 
-struct SoftMaxOperation {
-    static ttnn::Tensor invoke(const Tensor& a, float scale = 1.f);
-    static ttnn::Tensor invoke(const Tensor& a, const Tensor& mask, float scale = 1.f);
-};
-
-constexpr auto soft_max = ttnn::register_operation<"ttggml::soft_max", ttggml::SoftMaxOperation>();
+ttnn::Tensor soft_max(const Tensor& a, float scale = 1.f);
+ttnn::Tensor soft_max(const Tensor& a, const Tensor& mask, float scale = 1.f);
 
 } // namespace ttggml
