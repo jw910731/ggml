@@ -4,7 +4,6 @@
 #include <tuple>
 #include <variant>
 
-#include <ttnn/decorators.hpp>
 #include <ttnn/device_operation.hpp>
 #include <ttnn/tensor/tensor.hpp>
 #include <ttnn/tensor/types.hpp>
@@ -113,39 +112,46 @@ struct RoPEDeviceOperation {
 } // namespace rope_device
 
 namespace prim {
-constexpr auto rope =
-    ttnn::register_operation<"ttggml::prim::rope", ttggml::rope_device::RoPEDeviceOperation>();
+ttnn::Tensor rope(
+    const Tensor& src,
+    const Tensor& index,
+    std::optional<Tensor> freq_factor,
+    uint32_t active_dim_size,
+    RoPEType rope_type,
+    uint32_t n_ctx_orig,
+    float freq_base,
+    float freq_scale,
+    float ext_factor,
+    float attn_factor,
+    float beta_fast,
+    float beta_slow);
 } // namespace prim
 
-struct RoPEOperation {
-    static ttnn::Tensor invoke(
-        const Tensor& src_tensor,
-        const Tensor& index_tensor,
-        uint32_t active_dim_size,
-        RoPEType rope_type,
-        uint32_t n_ctx_orig = 512,
-        float freq_base = 10000.0f,
-        float freq_scale = 1.f,
-        float ext_factor = 0.f,
-        float attn_factor = 1.f,
-        float beta_fast = 0.f,
-        float beta_slow = 0.f);
+ttnn::Tensor rope(
+    const Tensor& src_tensor,
+    const Tensor& index_tensor,
+    uint32_t active_dim_size,
+    RoPEType rope_type,
+    uint32_t n_ctx_orig = 512,
+    float freq_base = 10000.0f,
+    float freq_scale = 1.f,
+    float ext_factor = 0.f,
+    float attn_factor = 1.f,
+    float beta_fast = 0.f,
+    float beta_slow = 0.f);
 
-    static ttnn::Tensor invoke(
-        const Tensor& src_tensor,
-        const Tensor& index_tensor,
-        const Tensor& freq_factor,
-        uint32_t active_dim_size,
-        RoPEType rope_type,
-        uint32_t n_ctx_orig = 512,
-        float freq_base = 10000.0f,
-        float freq_scale = 1.f,
-        float ext_factor = 0.f,
-        float attn_factor = 1.f,
-        float beta_fast = 0.f,
-        float beta_slow = 0.f);
-};
-
-constexpr auto rope = ttnn::register_operation<"ttggml::rope", ttggml::RoPEOperation>();
+ttnn::Tensor rope(
+    const Tensor& src_tensor,
+    const Tensor& index_tensor,
+    const Tensor& freq_factor,
+    uint32_t active_dim_size,
+    RoPEType rope_type,
+    uint32_t n_ctx_orig = 512,
+    float freq_base = 10000.0f,
+    float freq_scale = 1.f,
+    float ext_factor = 0.f,
+    float attn_factor = 1.f,
+    float beta_fast = 0.f,
+    float beta_slow = 0.f);
 
 } // namespace ttggml

@@ -3,7 +3,6 @@
 #include <tuple>
 #include <variant>
 
-#include <ttnn/decorators.hpp>
 #include <ttnn/device_operation.hpp>
 #include <ttnn/tensor/tensor.hpp>
 #include <ttnn/tensor/types.hpp>
@@ -90,17 +89,12 @@ struct FluxRoPEDeviceOperation {
 } // namespace flux_rope_device
 
 namespace prim {
-constexpr auto flux_rope =
-    ttnn::register_operation<"ttggml::prim::flux_rope", ttggml::flux_rope_device::FluxRoPEDeviceOperation>();
+ttnn::Tensor flux_rope(const Tensor& src, const Tensor& pe, bool rope_interleaved);
 } // namespace prim
 
-struct FluxRoPEOperation {
-    static ttnn::Tensor invoke(
-        const Tensor& src_tensor,
-        const Tensor& pe_tensor,
-        bool rope_interleaved = true);
-};
-
-constexpr auto flux_rope = ttnn::register_operation<"ttggml::flux_rope", ttggml::FluxRoPEOperation>();
+ttnn::Tensor flux_rope(
+    const Tensor& src_tensor,
+    const Tensor& pe_tensor,
+    bool rope_interleaved = true);
 
 } // namespace ttggml

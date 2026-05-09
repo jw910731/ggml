@@ -323,9 +323,31 @@ void rope_device::program::RoPEProgramFactory::override_runtime_arguments(
     }
 }
 
-// ---- RoPEOperation (outer wrapper) ----
+// ---- prim::rope ----
 
-ttnn::Tensor RoPEOperation::invoke(
+ttnn::Tensor prim::rope(
+    const Tensor& src,
+    const Tensor& index,
+    std::optional<Tensor> freq_factor,
+    uint32_t active_dim_size,
+    RoPEType rope_type,
+    uint32_t n_ctx_orig,
+    float freq_base,
+    float freq_scale,
+    float ext_factor,
+    float attn_factor,
+    float beta_fast,
+    float beta_slow)
+{
+    auto [attrs, args] = rope_device::RoPEDeviceOperation::invoke(
+        src, index, std::move(freq_factor), active_dim_size, rope_type,
+        n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    return ttnn::device_operation::detail::launch<rope_device::RoPEDeviceOperation>(attrs, args);
+}
+
+// ---- rope ----
+
+ttnn::Tensor rope(
     const Tensor& src_tensor, const Tensor& index_tensor,
     uint32_t active_dim_size, RoPEType rope_type, uint32_t n_ctx_orig,
     float freq_base, float freq_scale, float ext_factor, float attn_factor,
@@ -336,7 +358,7 @@ ttnn::Tensor RoPEOperation::invoke(
         ext_factor, attn_factor, beta_fast, beta_slow);
 }
 
-ttnn::Tensor RoPEOperation::invoke(
+ttnn::Tensor rope(
     const Tensor& src_tensor, const Tensor& index_tensor, const Tensor& freq_factor,
     uint32_t active_dim_size, RoPEType rope_type, uint32_t n_ctx_orig,
     float freq_base, float freq_scale, float ext_factor, float attn_factor,

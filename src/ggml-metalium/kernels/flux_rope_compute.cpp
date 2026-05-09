@@ -25,7 +25,7 @@
 #include "api/compute/eltwise_unary/eltwise_unary.h"
 #include "api/compute/eltwise_unary/identity.h"
 
-#include <tools/profiler/kernel_profiler.hpp>
+// #include <tools/profiler/kernel_profiler.hpp>
 
 #ifdef TRISC_MATH
 using namespace sfpi;

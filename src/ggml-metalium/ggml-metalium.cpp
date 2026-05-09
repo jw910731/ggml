@@ -51,7 +51,7 @@
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
 #include <ttnn/operations/data_movement/untilize/untilize.hpp>
 #include <ttnn/operations/experimental/transformer/nlp_kv_cache_load_slice/nlp_kv_cache_load_slice.hpp>
-#include <ttnn/operations/creation.hpp>
+#include <ttnn/operations/creation/creation.hpp>
 #include <ttnn/operations/eltwise/unary/unary_composite.hpp>
 #include <ttnn/operations/data_movement/transpose/transpose.hpp>
 #include <ttnn/operations/data_movement/permute/permute.hpp>

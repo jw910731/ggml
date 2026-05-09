@@ -4,8 +4,7 @@
 
 using std::uint32_t;
 
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
     uint32_t Mt =  get_arg_val<uint32_t>(0);
     uint32_t Nt =  get_arg_val<uint32_t>(1);
     uint32_t Kt =  get_arg_val<uint32_t>(2);
@@ -39,4 +38,3 @@ void MAIN {
     }
 
 }
-}  // namespace NAMESPACE
