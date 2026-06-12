@@ -1790,8 +1790,19 @@ static void ggml_backend_metalium_group_norm(ggml_backend_metalium_context * ctx
         grid_x--;
     }
     GGML_ASSERT(grid_x > 0 && "No valid grid_x for group_norm");
-    // grid_y: H*W is always much larger than max_grid.y, so use full grid
-    int grid_y = (int)max_grid.y;
+    // grid_y: with num_virtual_cols == grid_x, num_virtual_rows == grid_y, and
+    // tt-metal requires num_virtual_rows to divide the (padded) tile-height
+    // Ht = ceil(H*W / 32) and to be divisible by num_batches (N). Using the full
+    // max_grid.y blindly fails whenever Ht is not divisible by it (e.g. Ht=256,
+    // max_grid.y=10). Pick the largest grid_y <= max_grid.y meeting both.
+    int64_t Ht = (H * W + 31) / 32;
+    int grid_y = (int)std::min<int64_t>(max_grid.y, Ht);
+    while (grid_y > 0) {
+        if (Ht % grid_y == 0 && grid_y % N == 0)
+            break;
+        grid_y--;
+    }
+    GGML_ASSERT(grid_y > 0 && "No valid grid_y for group_norm");
     auto core_grid = ttnn::CoreGrid{(size_t)grid_x, (size_t)grid_y};
 
     // Create gamma (ones) and beta (zeros) in ROW_MAJOR [1, 1, C/32, 32]
@@ -2584,11 +2595,16 @@ static void ggml_backend_metalium_conv2d_direct(ggml_backend_metalium_context* c
     // 1x1 conv with stride 1 and no padding is a pointwise linear transform.
     // Implement as matmul to avoid ttnn::conv2d issues with zero-padding configs.
     if (KH == 1 && KW == 1 && s0 == 1 && s1 == 1 && p0 == 0 && p1 == 0) {
-        // input:  [N, IC, IH, IW] -> reshape to [N*IH*IW, IC]
+        // input:  [N, IC, IH, IW] -> permute to NHWC [N, IH, IW, IC] -> reshape to [N*IH*IW, IC]
         // weight: [OC, IC, 1, 1]  -> reshape to [IC, OC]
         // matmul: [N*IH*IW, IC] x [IC, OC] -> [N*IH*IW, OC]
         // reshape back to [N, OC, OH, OW]
-        auto input_2d = ttnn::reshape(*input_tt, ttnn::Shape({N * IH * IW, IC}));
+        // The input is NCHW (IW innermost), so it must be permuted to NHWC
+        // before flattening pixels into matmul rows; otherwise consecutive
+        // width values get treated as the channel vector (channel<->width
+        // scramble). The output reshape/permute below already assume NHWC.
+        auto input_nhwc = ttnn::permute(*input_tt, ttsl::SmallVector<int64_t>{0, 2, 3, 1});
+        auto input_2d = ttnn::reshape(input_nhwc, ttnn::Shape({N * IH * IW, IC}));
         auto weight_2d = ttnn::reshape(*weight_tt, ttnn::Shape({OC, IC}));
         weight_2d = ttnn::permute(weight_2d, ttsl::SmallVector<int64_t>{1, 0}); // [IC, OC]
 
@@ -3208,11 +3224,34 @@ static ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(ggml_backend
 }
 
 // Follow view_src chain to find the root tensor that owns device memory
-static struct ggml_tensor * find_view_root(struct ggml_tensor * t) {
-    while (t->view_src) {
-        t = t->view_src;
+// Find the node that actually owns the device memory backing `t`.
+//
+// This MUST mirror realize_ggml_view's data-location rule exactly, so that the
+// tensor we free is precisely the one whose extra->tensor realize() would read:
+//   - VIEW                       -> follow view_src
+//   - RESHAPE / PERMUTE / TRANSPOSE -> follow src[0] (the IMMEDIATE parent)
+//   - any other op (real or in-place) -> owns its extra->tensor; stop here.
+//
+// The src[0] distinction is the subtle part. In-place ops (ggml_add_inplace /
+// ggml_mul_inplace / ...) have view_src set just like a view, but they DO
+// execute and store their result in their OWN extra->tensor. ggml collapses
+// view_src to the ultimate base, so a reshape of an in-place result points its
+// view_src PAST the in-place node to the aliased source. Following view_src
+// there would skip the in-place node, leaving its device buffer with no free
+// target -> it leaks for the whole graph (this is what made z-image OOM after
+// accumulating every layer's RoPE/RMSNorm in-place results). Following src[0]
+// for reshape/permute/transpose lands on the in-place node, matching realize().
+static struct ggml_tensor * find_mem_holder(struct ggml_tensor * t) {
+    for (;;) {
+        if (t->op == GGML_OP_VIEW && t->view_src) {
+            t = t->view_src;
+        } else if ((t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
+                    t->op == GGML_OP_TRANSPOSE) && t->src[0]) {
+            t = t->src[0];
+        } else {
+            return t;
+        }
     }
-    return t;
 }
 
 static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -3222,20 +3261,20 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
     constexpr int magic = (1<<6)-1;
 
     // Build last-use map: for each tensor, the index of the last node that uses it as a source.
-    // We track the view root so we free the actual device memory holder.
+    // We track the memory holder so we free the actual device memory holder.
     std::unordered_map<struct ggml_tensor*, int> last_use;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         for (int s = 0; s < GGML_MAX_SRC; s++) {
             if (node->src[s]) {
-                last_use[find_view_root(node->src[s])] = i;
+                last_use[find_mem_holder(node->src[s])] = i;
             }
         }
     }
     // Also mark the final graph output so we never free it
     if (cgraph->n_nodes > 0) {
         struct ggml_tensor * final_node = cgraph->nodes[cgraph->n_nodes - 1];
-        last_use[find_view_root(final_node)] = cgraph->n_nodes; // beyond last index
+        last_use[find_mem_holder(final_node)] = cgraph->n_nodes; // beyond last index
     }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -3450,7 +3489,7 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
         for (int s = 0; s < GGML_MAX_SRC; s++) {
             struct ggml_tensor * src = node->src[s];
             if (!src) continue;
-            struct ggml_tensor * root = find_view_root(src);
+            struct ggml_tensor * root = find_mem_holder(src);
             auto it = last_use.find(root);
             if (it != last_use.end() && it->second == i && root->op != GGML_OP_NONE) {
                 auto * root_meta = (ggml_tensor_extra_metalium*)root->extra;
@@ -3463,6 +3502,22 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
                     }
                     root_meta->tensor.reset();
                 }
+            }
+        }
+
+        {
+            // Lightweight, env-gated DRAM probe. Set GGML_METALIUM_DUMP_MEM=1 to
+            // trace device-memory usage per ~256 graph nodes (useful for spotting
+            // intermediate-tensor accumulation / leaks).
+            static const bool dump_mem = getenv("GGML_METALIUM_DUMP_MEM") != nullptr;
+            if (dump_mem && (i % 256 == 0 || i == cgraph->n_nodes - 1)) {
+                auto st = ctx->device->allocator()->get_statistics(tt::tt_metal::BufferType::DRAM);
+                size_t nb = ctx->device->num_dram_channels();
+                fmt::println(stderr, "[MEM] i={} op={} name={} alloc={:.3f}GB free={:.3f}GB largest_free={:.3f}GB",
+                    i, ggml_op_name(node->op), node->name,
+                    (double)st.total_allocated_bytes * nb / 1e9,
+                    (double)st.total_free_bytes * nb / 1e9,
+                    (double)st.largest_free_block_bytes * nb / 1e9);
             }
         }
 
