@@ -1128,6 +1128,58 @@ static void add_conv2d_direct_tests(std::vector<std::unique_ptr<test_case>>& tes
         "CONV_2D 3x3 s1 p1 IC=256 8x8 N=1 (bottleneck)");
 }
 
+// Hypothesis #1 diagnostic: VAE 1x1-conv channel<->width layout scramble.
+//
+// The 1x1 fast path in ggml_backend_metalium_conv2d_direct (ggml-metalium.cpp,
+// the `if (KH==1 && KW==1 && s0==1 && s1==1 && p0==0 && p1==0)` branch) reshapes
+// the NCHW input [N,IC,IH,IW] straight to [N*IH*IW, IC] WITHOUT first permuting
+// to NHWC. The general (>=2x2 / padded) path right below it DOES permute to NHWC
+// before flattening. If that permute is missing, every 1x1 conv multiplies the
+// weight against width-neighbours instead of channels -> a whole-tensor scramble,
+// while >=2x2 convs stay correct.
+//
+// Each SUSPECT (1x1) case below is paired with a CONTROL (3x3) case on the SAME
+// IC/IH/IW/OC/N. Interpretation when running test-metalium:
+//   * SUSPECT fails (large nmse) + CONTROL passes  => hypothesis #1 CONFIRMED,
+//     and localized precisely to the 1x1 fast path.
+//   * Both pass                                    => #1 is NOT the cause; the
+//     garbage originates elsewhere (re-run without --diffusion-fa, or dump the
+//     pre-VAE latent and compare CPU-vs-Metalium).
+//   * Both fail                                    => conv2d_direct is broken for
+//     more than just the 1x1 path; widen the search.
+static void add_conv2d_1x1_diag_tests(std::vector<std::unique_ptr<test_case>>& tests)
+{
+    // s=1; p=0 with KH=KW=1 hits the 1x1 fast path, p=1 with KH=KW=3 hits the
+    // general NHWC-permute path. nmse threshold 1e-2 cleanly separates a correct
+    // matmul (<1e-2) from a channel<->width scramble (~O(0.1..2)).
+    auto conv = [&](int64_t IC, int64_t IH, int64_t IW, int64_t OC, int64_t N,
+                    int64_t KH, int64_t KW, int p, const char* name) {
+        tests.push_back(make_test([=](ggml_context* ctx) {
+            ggml_tensor* kernel = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, KW, KH, IC, OC);
+            ggml_tensor* image  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, IW, IH, IC, N);
+            return ggml_conv_2d_direct(ctx, kernel, image, 1, 1, p, p, 1, 1);
+        }, name, 1e-2));
+    };
+
+    // Matched pair: identical shape, only the kernel size (and thus dispatch
+    // path) differs. This is the decisive A/B test for #1.
+    conv(64, 16, 16, 128, 1, 3, 3, 1, "[#1 CONTROL] 3x3 s1 p1 IC=64 16x16 OC=128 N=1");
+    conv(64, 16, 16, 128, 1, 1, 1, 0, "[#1 SUSPECT] 1x1 s1 p0 IC=64 16x16 OC=128 N=1");
+
+    // Asymmetric IC != IH != IW so a channel<->width confusion cannot accidentally
+    // coincide with the correct answer.
+    conv(8, 4, 16, 8, 1, 3, 3, 1, "[#1 CONTROL] 3x3 IC=8 IH=4 IW=16 OC=8 N=1 (asym)");
+    conv(8, 4, 16, 8, 1, 1, 1, 0, "[#1 SUSPECT] 1x1 IC=8 IH=4 IW=16 OC=8 N=1 (asym)");
+
+    // Representative z-image VAE 1x1 sites (the convs that actually run in decode).
+    conv(16,  32, 32, 16,  1, 1, 1, 0, "[#1 SUSPECT] 1x1 post_quant_conv-like IC=16 32x32 OC=16");
+    conv(512, 32, 32, 512, 1, 1, 1, 0, "[#1 SUSPECT] 1x1 mid.attn q/k/v/proj-like IC=512 32x32 OC=512");
+    conv(256, 64, 64, 512, 1, 1, 1, 0, "[#1 SUSPECT] 1x1 nin_shortcut-like IC=256->512 64x64");
+
+    // Tiny case, easy to reason about by hand if you dump the buffers.
+    conv(2, 2, 4, 2, 1, 1, 1, 0, "[#1 SUSPECT] 1x1 IC=2 IH=2 IW=4 OC=2 N=1 (tiny)");
+}
+
 int main(int argc, char ** argv)
 {
     (void)argc;
@@ -1146,6 +1198,7 @@ int main(int argc, char ** argv)
     ggml_backend_t metalium = ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), NULL);
 
     std::vector<std::unique_ptr<test_case>> tests;
+    add_conv2d_1x1_diag_tests(tests);  // hypothesis #1: run first so an unrelated crash later doesn't mask it
     add_unittests(tests);
     add_flux_rope_tests(tests);
     add_im2col_tests(tests);
@@ -1155,6 +1208,80 @@ int main(int argc, char ** argv)
 
     ///////////////// put experiment code here /////////////////
     // easier on the eye to find it (also one line to disable UT)
+    // RMS_NORM: stage bisection of z-image diffusion pinpointed cap_embedder's
+    // RMSNorm as the broken op (Metalium output ~0 vs CPU large). No prior test.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        return ggml_rms_norm(ctx, a, 1e-6f);
+    }, "RMSNorm 64x64 basic", 1e-3));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2560, 122);
+        return ggml_rms_norm(ctx, a, 1e-6f);
+    }, "RMSNorm 2560x122 (cap_embedder shape)", 1e-3));
+    // Large-magnitude / outlier input (mimics Qwen massive activations) by scaling
+    // half the rows up; RMSNorm is per-row so this stresses the variance reduction.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2560, 16);
+        ggml_tensor* s = ggml_scale(ctx, a, 1000.0f);
+        return ggml_rms_norm(ctx, s, 1e-6f);
+    }, "RMSNorm 2560x16 large-magnitude", 1e-3));
+    // Broadcast MUL (vector * matrix) — the RMSNorm weight-apply pattern.
+    // RMSNorm does ggml_mul(x[hidden,tokens], w[hidden]); suspected broken on Metalium.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2048, 64);
+        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2048);
+        return ggml_mul(ctx, a, b);
+    }, "MUL broadcast vector*matrix 2048x64", 1e-3));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2560, 122);
+        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2560);
+        return ggml_mul(ctx, a, b);
+    }, "MUL broadcast vector*matrix 2560x122 (cap_embedder)", 1e-3));
+    // Large-magnitude weight (mimics the ~1000-magnitude RMSNorm weights on outlier channels).
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2560, 122);
+        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2560);
+        return ggml_mul(ctx, a, ggml_scale(ctx, b, 1000.0f));
+    }, "MUL broadcast large-weight 2560x122", 1e-2));
+    // The actual RMSNorm class pattern: rms_norm then broadcast mul.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2560, 122);
+        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2560);
+        return ggml_mul(ctx, ggml_rms_norm(ctx, a, 1e-6f), b);
+    }, "RMSNorm+weight 2560x122 (full cap pattern)", 1e-3));
+    // MASSIVE-ACTIVATION pattern: a few channels ~6000x larger than the rest,
+    // mimicking the Qwen text-encoder outliers that feed cap_embedder. RMSNorm
+    // is NOT scale-invariant under this (extreme per-row dynamic range) — this is
+    // the case the stage-bisection implicated.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* spike  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 16);    // outlier channels
+        ggml_tensor* normal = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2528, 16);  // normal channels
+        ggml_tensor* x = ggml_concat(ctx, ggml_scale(ctx, spike, 6000.0f), normal, 0);  // [2560,16]
+        ggml_tensor* w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2560);
+        return ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+    }, "RMSNorm+weight massive-activation outliers 2560x16", 1e-2));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* spike  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 16);
+        ggml_tensor* normal = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2528, 16);
+        ggml_tensor* x = ggml_concat(ctx, ggml_scale(ctx, spike, 6000.0f), normal, 0);
+        return ggml_rms_norm(ctx, x, 1e-6f);  // just the op, no weight
+    }, "RMSNorm massive-activation outliers 2560x16 (op only)", 1e-2));
+    // Real token count 122 (NON tile-aligned, pads to 128) WITH outliers — the
+    // exact cap_embedder case. Non-tile-aligned token dim + extreme dynamic range.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* spike  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 122);
+        ggml_tensor* normal = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2528, 122);
+        ggml_tensor* x = ggml_concat(ctx, ggml_scale(ctx, spike, 6000.0f), normal, 0);  // [2560,122]
+        ggml_tensor* w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2560);
+        return ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+    }, "RMSNorm+weight outliers 2560x122 (real cap case)", 1e-2));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* spike  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 122);
+        ggml_tensor* normal = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2528, 122);
+        ggml_tensor* x = ggml_concat(ctx, ggml_scale(ctx, spike, 6000.0f), normal, 0);
+        return ggml_rms_norm(ctx, x, 1e-6f);  // op only
+    }, "RMSNorm outliers 2560x122 (op only)", 1e-2));
+
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 32, 1, 1);
         ggml_tensor* mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 32, 1, 1);
