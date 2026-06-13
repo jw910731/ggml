@@ -1,7 +1,7 @@
 // Flux-RoPE compute kernel (interleaved mode)
 //
 // PE format: [L, D] in TILE, pe[l, 2*p] = cos, pe[l, 2*p+1] = -sin
-// Rotation: x' = x*cos + y*sin, y' = -x*sin + y*cos
+// Rotation: x' = x*cos - y*sin, y' = x*sin + y*cos
 //
 // Dest layout: slot 0 (regs 0-31) = src, slot 1 (regs 32-63) = PE
 //
@@ -17,8 +17,8 @@
 //   vFloat ns = dst_reg[p + i * 2 + 1];   // -sin from PE
 //   vFloat x  = dst_reg[s + i * 2];       // x_even from src
 //   vFloat y  = dst_reg[s + i * 2 + 1];   // x_odd from src
-//   dst_reg[s + i * 2]     = x * c - y * ns;   // x' = x*cos + y*sin
-//   dst_reg[s + i * 2 + 1] = x * ns + y * c;   // y' = -x*sin + y*cos
+//   dst_reg[s + i * 2]     = x * c + y * ns;   // x' = x*cos - y*sin
+//   dst_reg[s + i * 2 + 1] = y * c - x * ns;   // y' = x*sin + y*cos
 
 #include "api/compute/common.h"
 #include "api/compute/tile_move_copy.h"
@@ -44,18 +44,18 @@ inline void flux_rope_tile()
             vFloat x = dst_reg[s + i * 2];
             vFloat y = dst_reg[s + i * 2 + 1];
 
-            // Even output: x' = x*cos - y*(-sin) = x*cos + y*sin
+            // Even output: x' = x*cos - y*sin = x*cos + y*(-sin) = x*c + y*ns
             // Step 1: tmp = x * cos  (1 cross-slot multiply)
             vFloat tmp = x * dst_reg[p + i * 2];
-            // Step 2: tmp -= y * (-sin)  (1 cross-slot multiply, separate expression)
-            tmp -= y * dst_reg[p + i * 2 + 1];
+            // Step 2: tmp += y * (-sin)  (1 cross-slot multiply, separate expression)
+            tmp += y * dst_reg[p + i * 2 + 1];
             dst_reg[s + i * 2] = tmp;
 
-            // Odd output: y' = x*(-sin) + y*cos
-            // Step 1: tmp2 = x * (-sin)
-            vFloat tmp2 = x * dst_reg[p + i * 2 + 1];
-            // Step 2: tmp2 += y * cos
-            tmp2 += y * dst_reg[p + i * 2];
+            // Odd output: y' = x*sin + y*cos = y*cos - x*(-sin) = y*c - x*ns
+            // Step 1: tmp2 = y * cos
+            vFloat tmp2 = y * dst_reg[p + i * 2];
+            // Step 2: tmp2 -= x * (-sin)
+            tmp2 -= x * dst_reg[p + i * 2 + 1];
             dst_reg[s + i * 2 + 1] = tmp2;
         }
     }

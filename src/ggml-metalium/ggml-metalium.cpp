@@ -725,7 +725,13 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         return std::make_shared<tt::tt_metal::Tensor>(res);
     }
     if(op == GGML_OP_VIEW) {
-        std::shared_ptr<tt::tt_metal::Tensor> parent = realize_ggml_view(tensor->view_src);
+        // Resolve the parent via src0 (the immediate producer), NOT view_src.  ggml
+        // collapses view_src PAST in-place ops (ggml_add_inplace, ggml_mul_inplace, ...)
+        // to the underlying base buffer, but this backend does no true in-place compute:
+        // the in-place result lives in a FRESH tensor that IS src0, while the base buffer
+        // still holds stale pre-op data.  The offset/stride math below already uses src0,
+        // so reading the parent from src0 keeps them consistent and reads the correct data.
+        std::shared_ptr<tt::tt_metal::Tensor> parent = realize_ggml_view(src0);
         std::array dst_size = std::to_array(tensor->ne);
         std::array dst_stride = std::to_array(tensor->nb);
         std::array src_size = std::to_array(src0->ne);
@@ -3241,6 +3247,15 @@ static ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(ggml_backend
 // target -> it leaks for the whole graph (this is what made z-image OOM after
 // accumulating every layer's RoPE/RMSNorm in-place results). Following src[0]
 // for reshape/permute/transpose lands on the in-place node, matching realize().
+//
+// What makes freeing each holder independently SAFE: this backend never does
+// true device-side in-place compute. Every "inplace" handler allocates a fresh
+// make_shared device tensor and overwrites dst_meta (see e.g. ggml_backend_
+// metalium_bin_op and _scale), so no two nodes share a device buffer and each
+// holder's lifetime is exactly [produced .. last_use]. The lone exception is
+// GGML_OP_SET (KV-cache, ggml_backend_metalium_set) which really does alias dst
+// to the cache base, but that base has op==GGML_OP_NONE and is excluded from the
+// free loop by the `root->op != GGML_OP_NONE` guard, so it is never freed here.
 static struct ggml_tensor * find_mem_holder(struct ggml_tensor * t) {
     for (;;) {
         if (t->op == GGML_OP_VIEW && t->view_src) {
