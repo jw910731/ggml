@@ -2976,25 +2976,35 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         , intermidiate_type, tt::tt_metal::Layout::ROW_MAJOR);
 
     tt::tt_metal::DataType final_type = ggml2tt_type(ggtype, bufctx->device->arch());
-    if(tilize) {
-        t = ttnn::tilize_with_zero_padding(t.to_device(bufctx->device.get()), std::nullopt, final_type);
-        if(permute.has_value()) {
-            t = ttnn::permute(t, *permute);
+    {
+        // TTNN/tt-metal device operations (and the shared program cache) are NOT thread-safe.
+        // The model loader uploads tensors from multiple worker threads (see model_loader.cpp
+        // load_tensors()), so concurrent set_tensor calls would race here and corrupt the
+        // program cache ("Expected Program Binaries to be committed to DRAM" -> crash).
+        // Serialize all device interaction to keep multi-threaded loading of device-resident
+        // tensors (e.g. LoRA params) safe. Host-side conversion above stays parallel.
+        static std::mutex device_op_mutex;
+        std::lock_guard<std::mutex> device_op_lock(device_op_mutex);
+        if(tilize) {
+            t = ttnn::tilize_with_zero_padding(t.to_device(bufctx->device.get()), std::nullopt, final_type);
+            if(permute.has_value()) {
+                t = ttnn::permute(t, *permute);
+            }
         }
-    }
-    else {
-        t = t.to_device(bufctx->device.get());
-        GGML_ASSERT(t.dtype() == final_type && "Tensor dtype mismatch during tensor creation for row major tensors");
-        GGML_ASSERT(!permute.has_value() && "Cannot permute tensor without tilizing");
-    }
+        else {
+            t = t.to_device(bufctx->device.get());
+            GGML_ASSERT(t.dtype() == final_type && "Tensor dtype mismatch during tensor creation for row major tensors");
+            GGML_ASSERT(!permute.has_value() && "Cannot permute tensor without tilizing");
+        }
 
-    GGML_ASSERT(t.storage_type() == tt::tt_metal::StorageType::DEVICE);
-    GGML_ASSERT(t.dtype() == final_type);
-    GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, t));
-    GGML_ASSERT(t.layout() == (tilize ? tt::tt_metal::Layout::TILE : tt::tt_metal::Layout::ROW_MAJOR));
-    *meta = ggml_tensor_extra_metalium {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t)),
-    };
+        GGML_ASSERT(t.storage_type() == tt::tt_metal::StorageType::DEVICE);
+        GGML_ASSERT(t.dtype() == final_type);
+        GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, t));
+        GGML_ASSERT(t.layout() == (tilize ? tt::tt_metal::Layout::TILE : tt::tt_metal::Layout::ROW_MAJOR));
+        *meta = ggml_tensor_extra_metalium {
+            .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t)),
+        };
+    }
 }
 
 static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer,
