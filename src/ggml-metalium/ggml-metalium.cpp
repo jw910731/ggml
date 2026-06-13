@@ -1398,6 +1398,15 @@ static void ggml_backend_metalium_get_rows(ggml_backend_metalium_context * ctx, 
         };
     }
     else {
+        // ttnn::tosa::gather cannot read block-float (e.g. BFLOAT8_B from Q8_0) source data:
+        // it would gather the raw quantized bytes and produce garbage. Dequantize to BFLOAT16
+        // first, mirroring the readback path. This matters for quantized token-embedding weights
+        // (e.g. Qwen3VL token_embd.weight is Q8_0).
+        if(t->dtype() != tt::tt_metal::DataType::BFLOAT16 &&
+           t->dtype() != tt::tt_metal::DataType::FLOAT32 &&
+           t->dtype() != tt::tt_metal::DataType::UINT32) {
+            t = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*t, tt::tt_metal::DataType::BFLOAT16));
+        }
         // The operation wants 3D tensor but we have 4D, op also wants index be 2d
         auto src3d = t->reshape(t->logical_shape().to_rank(3));
         auto idx2d = idxs->reshape(idxs->logical_shape().to_rank(2));
@@ -2085,7 +2094,11 @@ static bool ggml_backend_metalium_can_rope(const struct ggml_tensor * dst)
         n_ctx_orig
     ] = int_params;
 
-    if(mode == GGML_ROPE_TYPE_NEOX) {
+    // mRoPE / interleaved-mRoPE (Qwen2-VL / Qwen3-VL via ggml_rope_multi) share the NeoX
+    // rotation layout and are dispatched through the NeoX kernel. In sd.cpp the LLM is only
+    // ever a text encoder, so the four position sections (t/h/w/e) collapse to the sequential
+    // token position and only the leading n_token index entries are consumed by the kernel.
+    if(mode == GGML_ROPE_TYPE_NEOX || mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE) {
         return n_dims % 64 == 0;
     }
     if(mode == GGML_ROPE_TYPE_NORMAL) {
@@ -2129,6 +2142,15 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
         beta_slow
     ] = float_params;
 
+    // NeoX, mRoPE and interleaved-mRoPE all use the NeoX rotation layout (pair i with
+    // i + n_dims/2). The multi-rope variants pack four position sections; only the leading
+    // n_token (t) positions are read by the kernel, matching the text-encoder usage where
+    // t == h == w == token index.
+    const ttggml::RoPEType rope_kind =
+        (mode == GGML_ROPE_TYPE_NEOX || mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE)
+            ? ttggml::RoPEType::NeoX
+            : ttggml::RoPEType::Normal;
+
     auto res = [&](){
         if(dst->src[2]) {
             return ttggml::rope(
@@ -2136,7 +2158,7 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
                 *realize_ggml_view(dst->src[1]),
                 *realize_ggml_view(dst->src[2]),
                 n_dims,
-                mode == GGML_ROPE_TYPE_NEOX ? ttggml::RoPEType::NeoX : ttggml::RoPEType::Normal,
+                rope_kind,
                 n_ctx_orig,
                 freq_base,
                 freq_scale,
@@ -2149,7 +2171,7 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
             *realize_ggml_view(dst->src[0]),
             *realize_ggml_view(dst->src[1]),
             n_dims,
-            mode == GGML_ROPE_TYPE_NEOX ? ttggml::RoPEType::NeoX : ttggml::RoPEType::Normal,
+            rope_kind,
             n_ctx_orig,
             freq_base,
             freq_scale,
@@ -2312,16 +2334,41 @@ static void ggml_backend_metalium_flash_attn(ggml_backend_metalium_context * ctx
     bool use_decode = (qt.logical_shape()[2] % kt.logical_shape()[1] == 0);
     bool use_non_decode = (qt.logical_shape()[1] % kt.logical_shape()[1] == 0);
 
+    // The decode SDPA kernel's circular buffers do not fit in L1 for large head dims
+    // (e.g. ideogram4: head_dim=256). The decode op is a workaround for full attention
+    // anyway, so for large head dims route to the prefill SDPA (with an explicit, L1-safe
+    // chunked program config) whenever the prefill precondition (nqh % nkv == 0) holds.
+    // Smaller head dims (e.g. z-image: head_dim=128) keep their existing path untouched.
+    const uint32_t head_dim = qt.logical_shape()[3];  // ne0
+    const bool force_prefill = (head_dim >= 256);
+    const bool do_prefill = use_non_decode && (!use_decode || force_prefill);
+
     ttnn::Tensor res;
-    if(use_non_decode && !use_decode) {
+    if(do_prefill) {
         // Non-decode (prefill) path: Q=[b, nqh, s, dh]
+        std::optional<ttnn::operations::transformer::SDPAProgramConfig> prog_cfg;
+        if(force_prefill) {
+            // Chunk Q/K so the per-core circular buffers fit L1 at large head_dim.
+            // q_chunk/k_chunk must be multiples of TILE_WIDTH (32); 128 divides the
+            // ideogram4 sequence length (1152) evenly.
+            prog_cfg = ttnn::operations::transformer::SDPAProgramConfig{
+                .compute_with_storage_grid_size = qt.device()->compute_with_storage_grid_size(),
+                .sub_core_grids                 = std::nullopt,
+                .q_chunk_size                   = 128,
+                .k_chunk_size                   = 128,
+                .exp_approx_mode                = std::nullopt,
+            };
+        }
         res = ttnn::transformer::scaled_dot_product_attention(
             qt,
             kt,
             vt,
             mask_tensor,
             false, /* is_causal */
-            scale
+            scale,
+            std::nullopt, /* sliding_window_size */
+            std::nullopt, /* memory_config */
+            prog_cfg
         );
     } else {
         // Decode path: Q=[1, b, nh, dh] (original code path)
