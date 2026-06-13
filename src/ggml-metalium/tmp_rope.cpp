@@ -56,8 +56,13 @@ void rope_device::RoPEDeviceOperation::validate_on_program_cache_miss(
     const auto& src_shape = src_tensor.logical_shape();
     const auto& index_shape = index_tensor.logical_shape();
 
-    TT_FATAL(src_shape[-3] == index_shape[-1],
-        "Shape mismatch: src_shape = {}, index_shape = {}. Expect format [batch, n_token, vec_dim] and [batch]",
+    // Standard RoPE supplies one position per token (index length == n_token).
+    // mRoPE / interleaved-mRoPE (ggml_rope_multi, used by Qwen2-VL / Qwen3-VL) packs
+    // four position sections [t, h, w, e] so the index length is 4*n_token; only the
+    // leading n_token (t) positions are consumed by the kernel below.
+    TT_FATAL(index_shape[-1] == src_shape[-3] || index_shape[-1] == 4 * src_shape[-3],
+        "Shape mismatch: src_shape = {}, index_shape = {}. Expect index length n_token "
+        "(standard RoPE) or 4*n_token (mRoPE) for format [batch, n_token, vec_dim]",
         src_shape, index_shape);
 
     TT_FATAL(index_tensor.dtype() == tt::tt_metal::DataType::INT32 ||
