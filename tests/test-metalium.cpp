@@ -360,8 +360,8 @@ static std::string type_name(ggml_type type)
 // CPU reference implementation of Flux-RoPE (interleaved)
 // PE format: [D, L] in GGML ne, with pe[l, 2*p] = cos, pe[l, 2*p+1] = -sin
 // x format:  [D, L, B] in GGML ne
-// Rotation: x' = x*cos - y*(-sin), y' = x*(-sin) + y*cos
-//           = x*cos + y*sin,        = -x*sin + y*cos
+// Rotation (standard +theta): x' = x*cos - y*sin, y' = x*sin + y*cos
+//   with c=cos, ns=-sin:      x' = x*c + y*ns,    y' = y*c - x*ns
 static void flux_rope_cpu_impl(ggml_tensor* dst, int ith, int nth, void* userdata) {
     (void)ith; (void)nth; (void)userdata;
 
@@ -384,8 +384,8 @@ static void flux_rope_cpu_impl(ggml_tensor* dst, int ith, int nth, void* userdat
                 const float c  = pe_data[l*D + 2*p];       // cos(theta)
                 const float ns = pe_data[l*D + 2*p + 1];   // -sin(theta)
 
-                dst_data[b*L*D + l*D + 2*p]     = xe * c - xo * ns;
-                dst_data[b*L*D + l*D + 2*p + 1] = xe * ns + xo * c;
+                dst_data[b*L*D + l*D + 2*p]     = xe * c + xo * ns;  // xe*cos - xo*sin
+                dst_data[b*L*D + l*D + 2*p + 1] = xo * c - xe * ns;  // xe*sin + xo*cos
             }
         }
     }
@@ -482,6 +482,129 @@ static void add_flux_rope_tests(std::vector<std::unique_ptr<test_case>>& tests)
     make_non_interleaved_test(60,  50, 4,  "Flux-RoPE non-interleaved 60x50x4 (non tile aligned)");
     make_non_interleaved_test(128, 256, 48, "Flux-RoPE non-interleaved 128x256x48 (Flux-scale)");
     make_non_interleaved_test(2,   64, 1,  "Flux-RoPE non-interleaved 2x64x1 (minimal D)");
+}
+
+// Mirror the FULL Rope::apply_rope (interleaved) graph, INCLUDING the on-device
+// pe-extraction (strided ggml_view_3d row-0 of a real [2,2,d/2,L] pe tensor + cont)
+// and the x-prep permute/cont that the bare flux_rope tests above skip.  The harness
+// compares every node CPU-vs-Metalium, so a divergence localizes to the exact prep op
+// or the kernel.  Shapes match z-image (d_head=128, num_heads=30).
+static void add_apply_rope_full_path_tests(std::vector<std::unique_ptr<test_case>>& tests)
+{
+    // Isolated pe-extraction: [2,2,d/2,L] -> row-0 strided view -> cont -> [D,L].
+    // This is the part the existing flux_rope tests never exercise on device.
+    auto make_pe_extract = [&](int64_t d_head, int64_t L, const char* name) {
+        tests.push_back(make_test([=](ggml_context* ctx) {
+            ggml_tensor* pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, d_head / 2, L);
+            auto pe_prep = ggml_view_3d(ctx, pe, 2, d_head / 2, L, pe->nb[2], pe->nb[3], 0);
+            pe_prep = ggml_cont(ctx, pe_prep);
+            return ggml_reshape_2d(ctx, pe_prep, d_head, L);
+        }, name, 1e-3));
+    };
+    make_pe_extract(128, 64,   "apply_rope pe-extract d128 L64");
+    make_pe_extract(128, 256,  "apply_rope pe-extract d128 L256");
+    make_pe_extract(128, 1024, "apply_rope pe-extract d128 L1024 (z-image scale)");
+
+    // Full path: x [d_head, n_head, L, N] + pe [2,2,d/2,L] -> apply_rope (interleaved).
+    auto make_full = [&](int64_t d_head, int64_t n_head, int64_t L, int64_t N, const char* name) {
+        tests.push_back(make_test([=](ggml_context* ctx) {
+            ggml_tensor* x  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d_head, n_head, L, N);
+            ggml_tensor* pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, d_head / 2, L);
+
+            auto x_prep = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));  // [d_head, L, n_head, N]
+            x_prep = ggml_reshape_3d(ctx, x_prep, d_head, L, n_head * N);    // [D, L, B]
+
+            auto pe_prep = ggml_view_3d(ctx, pe, 2, d_head / 2, L, pe->nb[2], pe->nb[3], 0);
+            pe_prep = ggml_cont(ctx, pe_prep);
+            pe_prep = ggml_reshape_2d(ctx, pe_prep, d_head, L);
+
+            ggml_tensor* args[2] = {x_prep, pe_prep};
+            auto x_out = ggml_custom_4d(ctx, GGML_TYPE_F32, d_head, L, n_head * N, 1,
+                args, 2, flux_rope_cpu_impl, 1, (void*)FLUX_ROPE_INTERLEAVED_TAG);
+            return ggml_reshape_3d(ctx, x_out, d_head, L, n_head * N);
+        }, name, 1e-3));
+    };
+    make_full(128, 4,  64,   1, "apply_rope full path d128 h4 L64");
+    make_full(128, 30, 256,  1, "apply_rope full path d128 h30 L256 (z-image heads)");
+    make_full(128, 30, 1024, 1, "apply_rope full path d128 h30 L1024 (z-image scale)");
+}
+
+// The real diffusion weights are BF16 (z-image-turbo-BF16.gguf); every Linear is
+// mul_mat(bf16_weight, f32_activation).  The existing mul_mat tests are all F32, so a
+// BF16-weight-specific matmul bug would pass every F32 unit test yet corrupt the whole
+// model.  Compare BF16/F16-weight matmul (incl. large activations) against the CPU ref.
+static void add_lowprec_matmul_tests(std::vector<std::unique_ptr<test_case>>& tests)
+{
+    auto make = [&](int64_t K, int64_t M, int64_t N, ggml_type wtype, float scale, std::string name) {
+        tests.push_back(make_test([=](ggml_context* ctx) {
+            ggml_tensor* a = ggml_new_tensor_2d(ctx, wtype, K, M);          // weight [K, M]
+            ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);  // activation [K, N]
+            if (scale != 1.0f) {
+                b = ggml_scale(ctx, b, scale);
+            }
+            return ggml_mul_mat(ctx, a, b);                                 // [M, N]
+        }, name, 5e-2));
+    };
+    for (ggml_type wt : {GGML_TYPE_BF16, GGML_TYPE_F16}) {
+        std::string t = type_name(wt);
+        make(128,  128,  64, wt, 1.0f,   "mul_mat " + t + "-weight 128x128 (small)");
+        make(64,   3840, 64, wt, 1.0f,   "mul_mat " + t + "-weight x_embedder 64->3840");
+        make(2560, 3840, 64, wt, 1.0f,   "mul_mat " + t + "-weight cap_embedder 2560->3840");
+        make(3840, 3840, 64, wt, 1.0f,   "mul_mat " + t + "-weight hidden 3840->3840");
+        make(3840, 3840, 64, wt, 100.0f, "mul_mat " + t + "-weight 3840 large-act x100");
+    }
+}
+
+// Hypothesis: realize_ggml_view resolves a VIEW via view_src, but ggml collapses the
+// view_src of a view-of-an-inplace-result PAST the inplace node to the stale base.
+// So reading a view (or reshape) of x = ggml_*_inplace(a, b) may return a's pre-op data
+// instead of the computed result.  Isolated single ops never expose this; a 34-layer
+// graph full of inplace residuals/norms would.  cont() forces materialization so the
+// node is actually compared (bare view ops are skipped by the compare harness).
+static void add_inplace_view_tests(std::vector<std::unique_ptr<test_case>>& tests)
+{
+    // view (sub-block) of an inplace ADD result
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* c = ggml_add_inplace(ctx, a, b);
+        ggml_tensor* v = ggml_view_2d(ctx, c, 32, 64, c->nb[1], 0);
+        return ggml_cont(ctx, v);
+    }, "view of add_inplace result", 1e-3));
+
+    // full-size view of an inplace ADD result (exercises the view fast-path)
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* c = ggml_add_inplace(ctx, a, b);
+        return ggml_cont(ctx, ggml_view_tensor(ctx, c));
+    }, "full view of add_inplace result", 1e-3));
+
+    // view of an inplace MUL result
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* c = ggml_mul_inplace(ctx, a, b);
+        ggml_tensor* v = ggml_view_2d(ctx, c, 32, 64, c->nb[1], 0);
+        return ggml_cont(ctx, v);
+    }, "view of mul_inplace result", 1e-3));
+
+    // reshape of an inplace ADD result (control: realize uses src[0], should pass)
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* c = ggml_add_inplace(ctx, a, b);
+        return ggml_cont(ctx, ggml_reshape_2d(ctx, c, 32, 128));
+    }, "reshape of add_inplace result (control)", 1e-3));
+
+    // view of a NON-inplace ADD result (control: should pass)
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* c = ggml_add(ctx, a, b);
+        ggml_tensor* v = ggml_view_2d(ctx, c, 32, 64, c->nb[1], 0);
+        return ggml_cont(ctx, v);
+    }, "view of (non-inplace) add result (control)", 1e-3));
 }
 
 static void add_unittests(std::vector<std::unique_ptr<test_case>>& tests)
@@ -1201,6 +1324,9 @@ int main(int argc, char ** argv)
     add_conv2d_1x1_diag_tests(tests);  // hypothesis #1: run first so an unrelated crash later doesn't mask it
     add_unittests(tests);
     add_flux_rope_tests(tests);
+    add_apply_rope_full_path_tests(tests);
+    add_lowprec_matmul_tests(tests);
+    add_inplace_view_tests(tests);
     add_im2col_tests(tests);
     add_group_norm_tests(tests);
     add_upscale_tests(tests);
