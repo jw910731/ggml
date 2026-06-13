@@ -246,6 +246,11 @@ static tt::tt_metal::DataType ggml2tt_type_internal(ggml_type ggtype, tt::ARCH a
         static constexpr std::array<tt::tt_metal::DataType, GGML_TYPE_COUNT> table = {
             /*GGML_TYPE_F32        = */ tt::tt_metal::DataType::BFLOAT16,
             /*GGML_TYPE_F16        = */ tt::tt_metal::DataType::BFLOAT16,
+            // NOTE: BFLOAT4_B (4-bit block float) is fully supported by this backend (storage,
+            // dequant-on-realize, readback, and matmul all handle it), but mapping matmul weights
+            // to it is too lossy in practice — routing the ideogram4 DiT's Q4_0 weights to BFLOAT4_B
+            // collapses the output (std ~13 -> ~1.6). Keep 8-bit block float as the default; switch a
+            // specific type to BFLOAT4_B only where memory matters more than fidelity.
             /*GGML_TYPE_Q4_0       = */ tt::tt_metal::DataType::BFLOAT8_B,
             /*GGML_TYPE_Q4_1       = */ tt::tt_metal::DataType::BFLOAT8_B,
             tt::tt_metal::DataType::INVALID,
@@ -692,10 +697,18 @@ static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tens
     return ttnn::reshape(tensor, ttnn::Shape(target_shape));
 }
 
-static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor);
-static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tensor)
+// Block-float (BFLOAT8_B / BFLOAT4_B) is the on-device storage for quantized weights. TTNN ops
+// generally cannot read block-float operands directly (matmul is the exception); for every other op
+// we must dequantize the operand to BFLOAT16 first. realize_ggml_view() dequantizes by default and
+// the cast happens at the leaf, so any downstream view/transpose/permute sees BFLOAT16. Pass
+// keep_block_float=true (matmul only) to keep the packed weight for the block-float matmul path.
+static inline bool tt_dtype_is_block_float(tt::tt_metal::DataType dt) {
+    return dt == tt::tt_metal::DataType::BFLOAT8_B || dt == tt::tt_metal::DataType::BFLOAT4_B;
+}
+static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor, bool keep_block_float);
+static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tensor, bool keep_block_float = false)
 {
-    auto res = realize_ggml_view_impl(tensor);
+    auto res = realize_ggml_view_impl(tensor, keep_block_float);
     ggml_tensor_extra_metalium* meta = static_cast<ggml_tensor_extra_metalium*>(tensor->extra);
     // We hack around weight transposed issue that maeks this test fail. But the performance gain is worth the inconsistency
     if(!ggml_tt_tensors_shape_equal(tensor, *res) && !meta->is_pretransposed) {
@@ -708,7 +721,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
 }
 
 
-static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor)
+static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor, bool keep_block_float)
 {
     // Since TTNN does not support the traditional view operation, we had to support it ourselves
     // This function, realize, extracts the data from the source tensor and creates a new tensor
@@ -720,7 +733,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
 
     // Do we really need to lazy evaluate this? Currently transpose is eagerly evaluated
     if(op == GGML_OP_TRANSPOSE) {
-        auto parent = realize_ggml_view(src0);
+        auto parent = realize_ggml_view(src0, keep_block_float);
         auto res = ttnn::transpose(*parent, -2, -1);
         return std::make_shared<tt::tt_metal::Tensor>(res);
     }
@@ -731,7 +744,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         // the in-place result lives in a FRESH tensor that IS src0, while the base buffer
         // still holds stale pre-op data.  The offset/stride math below already uses src0,
         // so reading the parent from src0 keeps them consistent and reads the correct data.
-        std::shared_ptr<tt::tt_metal::Tensor> parent = realize_ggml_view(src0);
+        std::shared_ptr<tt::tt_metal::Tensor> parent = realize_ggml_view(src0, keep_block_float);
         std::array dst_size = std::to_array(tensor->ne);
         std::array dst_stride = std::to_array(tensor->nb);
         std::array src_size = std::to_array(src0->ne);
@@ -896,7 +909,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         return std::make_shared<tt::tt_metal::Tensor>(std::move(res));
     }
     if(op == GGML_OP_RESHAPE) {
-        auto t = realize_ggml_view(src0);
+        auto t = realize_ggml_view(src0, keep_block_float);
         return std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(*t, tensor));
     }
     if(op == GGML_OP_PERMUTE) {
@@ -909,7 +922,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         }
         GGML_ASSERT(ndiff != 1); // Logically impossible
 
-        auto t = realize_ggml_view(src0);
+        auto t = realize_ggml_view(src0, keep_block_float);
 
         bool all_zero = true;
         for(int i=0;i<GGML_MAX_DIMS;i++) {
@@ -938,12 +951,18 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
     ggml_tensor_extra_metalium* meta = (ggml_tensor_extra_metalium*)tensor->extra;
     GGML_ASSERT(meta != nullptr);
     if(meta != nullptr && meta->tensor != nullptr) {
+        // Dequantize block-float (BFLOAT8_B / BFLOAT4_B) operands to BFLOAT16 for ops that cannot
+        // read packed block-float (everything except the matmul path, which passes keep_block_float).
+        if(!keep_block_float && tt_dtype_is_block_float(meta->tensor->dtype())) {
+            return std::make_shared<tt::tt_metal::Tensor>(
+                ttnn::typecast(*meta->tensor, tt::tt_metal::DataType::BFLOAT16));
+        }
         return meta->tensor;
     }
 
     if(is_view(tensor) && tensor->view_src != nullptr) {
         // recursivly resolve the source tensor
-        return realize_ggml_view(tensor->view_src);
+        return realize_ggml_view(tensor->view_src, keep_block_float);
     }
 
     // HACK: Fallback path: if somehow the framework does not set the real tensor, we can make our own
@@ -1038,8 +1057,9 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
         GGML_ASSERT(nb1 <= nb2);
         GGML_ASSERT(nb2 <= nb3);
 
-        auto ap = realize_ggml_view(src0);
-        auto bp = realize_ggml_view(src1);
+        // matmul is the one path that consumes block-float (BFLOAT8_B/BFLOAT4_B) weights directly.
+        auto ap = realize_ggml_view(src0, /*keep_block_float=*/true);
+        auto bp = realize_ggml_view(src1, /*keep_block_float=*/true);
         auto &a = *ap;
         auto &b = *bp;
 
@@ -1075,7 +1095,8 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
         uint32_t prec = dst->op_params[0];
         bool high_percision = prec == GGML_PREC_F32;
 
-        auto res = ttggml::mul_mat(*realize_ggml_view(dst->src[0]), *realize_ggml_view(dst->src[1]), high_percision);
+        auto res = ttggml::mul_mat(*realize_ggml_view(dst->src[0], /*keep_block_float=*/true),
+                                   *realize_ggml_view(dst->src[1], /*keep_block_float=*/true), high_percision);
 
         *dst_meta = ggml_tensor_extra_metalium{
             .tensor = std::make_shared<tt::tt_metal::Tensor>(res),
@@ -1398,15 +1419,8 @@ static void ggml_backend_metalium_get_rows(ggml_backend_metalium_context * ctx, 
         };
     }
     else {
-        // ttnn::tosa::gather cannot read block-float (e.g. BFLOAT8_B from Q8_0) source data:
-        // it would gather the raw quantized bytes and produce garbage. Dequantize to BFLOAT16
-        // first, mirroring the readback path. This matters for quantized token-embedding weights
-        // (e.g. Qwen3VL token_embd.weight is Q8_0).
-        if(t->dtype() != tt::tt_metal::DataType::BFLOAT16 &&
-           t->dtype() != tt::tt_metal::DataType::FLOAT32 &&
-           t->dtype() != tt::tt_metal::DataType::UINT32) {
-            t = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*t, tt::tt_metal::DataType::BFLOAT16));
-        }
+        // src0 (e.g. a quantized token-embedding weight) is dequantized to BFLOAT16 by
+        // realize_ggml_view above: ttnn::tosa::gather cannot read packed block-float.
         // The operation wants 3D tensor but we have 4D, op also wants index be 2d
         auto src3d = t->reshape(t->logical_shape().to_rank(3));
         auto idx2d = idxs->reshape(idxs->logical_shape().to_rank(2));
