@@ -4078,24 +4078,16 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
             .context = dev_ctx
         };
         ctx->devices.push_back(dev);
-        // Intentionally leak `dev_ctx` (and the shared_ptr<MeshDevice> it holds) so the MeshDevice
-        // is never destroyed. This is required, not just convenient:
-        //
-        // GGML exposes no teardown hook for backend_reg / devices, so any cleanup we register would
-        // have to run from a std::atexit handler or static destructor at process exit. That is
-        // fatally too late for Metalium. ttnn's GraphTracker keeps its active-processor list in a
-        // *main-thread* thread_local (tt::tt_metal::GraphTracker::processors), and glibc destroys
-        // main-thread thread_locals BEFORE any atexit/static destructor runs. Destroying the
-        // MeshDevice runs ~MeshDeviceImpl, which tears down the program cache; the cached Tensors
-        // call GraphTracker::is_enabled() from their destructor, reading the already-destroyed
-        // thread_local -> segfault. Closing the device first does not help either: the program cache
-        // is only freed in ~MeshDeviceImpl, never in close().
-        //
-        // Leaking is the safe choice for a process-global device that lives until exit: the OS
-        // reclaims host memory and the kernel/KMD releases the hardware when the process exits.
-        // Other static holders (e.g. buffer_type_context_deleter) may drop their MeshDevice refs at
-        // exit, but this pinned ref keeps the refcount >= 1 so ~MeshDeviceImpl never runs.
-        (void)dev_ctx;
+        // GGML does not have free for backend_reg and devices. Will force free on exit (thanks to RAII) but Metalium
+        // already de-init at that point
+        static std::vector<std::unique_ptr<ggml_backend_metalium_device_context>> g_backend_device_holder;
+        g_backend_device_holder.push_back(std::unique_ptr<ggml_backend_metalium_device_context>(dev_ctx));
+        std::atexit([]() {
+            for (auto & dev : g_backend_device_holder) {
+                fmt::println("dev reset: addr({:x})", reinterpret_cast<uint64_t>(dev.get()));
+                dev.reset();
+            }
+        });
 
         reg = ggml_backend_reg {
             /* .api_version = */ GGML_BACKEND_API_VERSION,
