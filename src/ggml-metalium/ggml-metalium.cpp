@@ -201,9 +201,9 @@ static ttnn::DeviceComputeKernelConfig make_compute_kernel_config(ttnn::IDevice*
 struct ggml_backend_metalium_debug_flags {
     bool print_rejected_ops = false;        // Print ops that the backend rejects
     bool print_view = false;                // Print details when a VIEW op is being realized
-    bool cache_mm_transpose = false;        // Cache the transpose kernel for matmul
+    bool cache_mm_transpose = true;        // Cache the transpose kernel for matmul
     bool disable_program_cache = false;     // Disables the program cache
-    bool experimental_ops = false;          // Enable experimental ops that is known to cause trouble
+    bool experimental_ops = true;          // Enable experimental ops that is known to cause trouble
 };
 
 static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
@@ -976,13 +976,17 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
     GGML_ASSERT(false && "Fallback path not implemented");
 }
 
-inline static void ggml_metalium_op_src_sanity_check(const struct ggml_tensor * node, int idx) {
+inline static void ggml_metalium_op_src_sanity_check(const struct ggml_tensor * node, int idx, bool require_tile = true) {
     GGML_ASSERT(node->src[idx] != NULL);
     GGML_ASSERT(node->src[idx]->extra != NULL);
     auto* meta = (ggml_tensor_extra_metalium*)(node->src[idx]->extra);
     if(meta->tensor != NULL) {
         GGML_ASSERT(meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE);
-        GGML_ASSERT(meta->tensor->layout() == tt::tt_metal::Layout::TILE);
+        // Conv weights are stored ROW_MAJOR on device (see set_tensor); their consumer
+        // (conv2d_direct) accepts either layout and uses the *_ANY_LAYOUT variant.
+        if(require_tile) {
+            GGML_ASSERT(meta->tensor->layout() == tt::tt_metal::Layout::TILE);
+        }
     }
 }
 
@@ -993,6 +997,8 @@ inline static void ggml_metalium_op_src_sanity_check(const struct ggml_tensor * 
 #define GGML_METALIUM_OP_SRC_SANITY_CHECK(_node, _idx) ggml_metalium_op_src_sanity_check(_node, _idx);
 #define GGML_METALIUM_OP_SRC0_SANITY_CHECK(_node) GGML_METALIUM_OP_SRC_SANITY_CHECK(_node, 0)
 #define GGML_METALIUM_OP_SRC1_SANITY_CHECK(_node) GGML_METALIUM_OP_SRC_SANITY_CHECK(_node, 1)
+// Layout-agnostic variant: the source may be ROW_MAJOR (e.g. conv weights, see set_tensor).
+#define GGML_METALIUM_OP_SRC0_SANITY_CHECK_ANY_LAYOUT(_node) ggml_metalium_op_src_sanity_check(_node, 0, false);
 
 
 // Experimental flag to enable or disable custom mul_mat
@@ -2626,7 +2632,9 @@ static void ggml_backend_metalium_upscale(ggml_backend_metalium_context * ctx, s
 
 static void ggml_backend_metalium_conv2d_direct(ggml_backend_metalium_context* ctx, struct ggml_tensor* dst) {
     GGML_METALIUM_OP_SANITY_CHECK(dst);
-    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    // src0 is the conv kernel, stored ROW_MAJOR on device (see set_tensor) to avoid
+    // kernel-dim tile padding; allow either layout here.
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK_ANY_LAYOUT(dst);
     GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
 
     // src0 (kernel): GGML ne [KW, KH, IC, OC] -> TT shape [OC, IC, KH, KW] (OIHW)
@@ -2673,6 +2681,12 @@ static void ggml_backend_metalium_conv2d_direct(ggml_backend_metalium_context* c
         auto input_nhwc = ttnn::permute(*input_tt, ttsl::SmallVector<int64_t>{0, 2, 3, 1});
         auto input_2d = ttnn::reshape(input_nhwc, ttnn::Shape({N * IH * IW, IC}));
         auto weight_2d = ttnn::reshape(*weight_tt, ttnn::Shape({OC, IC}));
+        // Conv weights are stored ROW_MAJOR (see set_tensor); the matmul path needs TILE.
+        // Reshape to 2D [OC,IC] first so tilize pads tile-aligned channel dims rather than
+        // re-exploding the 1x1 kernel dims.
+        if (weight_2d.layout() != tt::tt_metal::Layout::TILE) {
+            weight_2d = ttnn::tilize_with_zero_padding(weight_2d);
+        }
         weight_2d = ttnn::permute(weight_2d, ttsl::SmallVector<int64_t>{1, 0}); // [IC, OC]
 
         auto output = ttnn::matmul(input_2d, weight_2d);
@@ -2713,10 +2727,16 @@ static void ggml_backend_metalium_conv2d_direct(ggml_backend_metalium_context* c
     //     slice and has hung in practice. By pulling to host ourselves via
     //     .cpu() and handing ttnn a host ROW_MAJOR tensor we take the clean
     //     prepare_conv_weights_biases_and_move_to_device() path instead.
-    auto weight_host = ttnn::untilize_with_unpadding(
-        *weight_tt,
-        ttnn::Shape({OC - 1, IC - 1, KH - 1, KW - 1}),
-        std::nullopt).cpu();
+    // Conv weights are stored ROW_MAJOR (see set_tensor) to avoid kernel-dim tile padding,
+    // but other paths may still hand us a TILE weight, so handle both: untilize if tiled,
+    // otherwise pull the row-major weight straight to host.
+    tt::tt_metal::Tensor weight_host =
+        (weight_tt->layout() == tt::tt_metal::Layout::TILE)
+            ? ttnn::untilize_with_unpadding(
+                  *weight_tt,
+                  ttnn::Shape({OC - 1, IC - 1, KH - 1, KW - 1}),
+                  std::nullopt).cpu()
+            : weight_tt->cpu();
 
     // GGML weights are already [OC, IC, KH, KW] (OIHW), which matches ttnn.
     // weight_host is host ROW_MAJOR; ttnn will prepare+upload it.
@@ -2992,6 +3012,22 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     }
     GGML_ASSERT(storage.has_value() && "Failed to convert data to TT storage");
 
+    // Conv kernels arrive as 4D ggml tensors (ne = [KW, KH, IC, OC]).  tilize_with_zero_padding
+    // pads the last two TT dims (the tiny KH,KW kernel extents) up to a full 32x32 tile, which
+    // inflates e.g. a [512,512,3,3] weight from ~5MB to ~537MB (~113x) and a 1x1 conv even more.
+    // The sole consumer of conv-weight data (ggml_backend_metalium_conv2d_direct) untilizes the
+    // weight back to ROW_MAJOR anyway, so storing it tiled is pure waste that OOMs the device once
+    // all models are resident.  Keep 4D float weights untiled; conv2d_direct handles both layouts.
+    // Restricted to:
+    //   - WEIGHTS buffers: 4D compute *inputs* (e.g. the RoPE `pe` leaf, ne=[2,2,...]) are also
+    //     4D with tiny inner dims, but their consumers (flux_rope, ...) require TILE layout.
+    //   - types whose row-major device dtype is BFLOAT16 (matches intermidiate_type, so the
+    //     to_device() dtype check below passes and contiguous weights need no permute).
+    if(tilize && buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && ggml_n_dims(tensor) == 4 &&
+       (ggtype == GGML_TYPE_F32 || ggtype == GGML_TYPE_F16 || ggtype == GGML_TYPE_BF16)) {
+        tilize = false;
+    }
+
     // Convert GGML shape to TT shape
     ttsl::SmallVector<uint32_t> shape(GGML_MAX_DIMS, 1);
     for(int i = 0; i < GGML_MAX_DIMS; i++) {
@@ -3065,6 +3101,25 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         *meta = ggml_tensor_extra_metalium {
             .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t)),
         };
+
+        // Lightweight, env-gated upload probe (mirrors GGML_METALIUM_DUMP_MEM). Set
+        // GGML_METALIUM_DUMP_UPLOAD=1 to trace device DRAM growth per ~32 uploaded
+        // tensors — useful for spotting weight-storage blowups (e.g. tile-padded conv
+        // kernels) when all models are resident on device.
+        static const bool dump_upload = getenv("GGML_METALIUM_DUMP_UPLOAD") != nullptr;
+        if (dump_upload) {
+            static size_t upload_count = 0;
+            size_t n = ++upload_count;
+            if (n % 32 == 0) {
+                auto st     = bufctx->device->allocator()->get_statistics(tt::tt_metal::BufferType::DRAM);
+                size_t nb   = bufctx->device->num_dram_channels();
+                fmt::println(stderr, "[UPLOAD] n={} name={} alloc={:.3f}GB free={:.3f}GB largest_free={:.3f}GB",
+                    n, tensor->name,
+                    (double)st.total_allocated_bytes * nb / 1e9,
+                    (double)st.total_free_bytes * nb / 1e9,
+                    (double)st.largest_free_block_bytes * nb / 1e9);
+            }
+        }
     }
 }
 
