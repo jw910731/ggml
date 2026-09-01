@@ -27,7 +27,9 @@
 #include "umd/device/types/arch.hpp"
 #include "umd/device/types/cluster_descriptor_types.hpp"
 #include <string.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <unistd.h>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -39,6 +41,7 @@
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <tt-metalium/graph_tracking.hpp>
 #include <ttnn/core.hpp>
 #include <ttnn/device.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
@@ -492,66 +495,25 @@ static tt::tt_metal::HostBuffer quantized_ggml_data_to_tt_host_buffer(const void
 // convert to FP32 then convert into the desired format
 template <typename SrcType>
 static void copy_tt_tensor_to_host_pointer(const ttnn::Tensor& tensor, void* dst, ggml_type dst_ggtype) {
-    ttnn::Shape shape = tensor.logical_shape();
-    ttnn::Shape padded_shape = tensor.padded_shape();
-
     // we only support reading from these types that is held in TT tensor
     static_assert(std::is_same_v<SrcType, float> || std::is_same_v<SrcType, bfloat16> || std::is_same_v<SrcType, uint32_t>);
 
-    ttnn::Tensor row_major_tensor = tensor;
-    if(tensor.layout() == ttnn::TILE_LAYOUT) {
-        // FIXME: untilize is cursed. Causes _MANY_ corruption errors. Replacing it with to_layout
-        // Fixes the majority of accuracy and corruption errors in test-backend-ops
-        // Ofc this is slower so we really want to enable untilize on device
-        // row_major_tensor = ttnn::untilize(tensor).cpu();
-        row_major_tensor = tensor.cpu().to_layout(ttnn::ROW_MAJOR_LAYOUT);
-    }
-    else {
-       row_major_tensor = tensor.cpu();
-    }
-    GGML_ASSERT(row_major_tensor.storage_type() == ttnn::StorageType::HOST);
-    GGML_ASSERT(row_major_tensor.layout() == ttnn::ROW_MAJOR_LAYOUT);
-
-    // Grab the data held in the TT tensor
-    const ttnn::HostStorage& storage = row_major_tensor.host_storage();
-    const auto buffer = storage.buffer().get_shard({0, 0}).value();
-    auto view = buffer.view_as<SrcType>();
-    const SrcType* buf = &view[0];
-    size_t buf_size = view.size();
-    GGML_ASSERT(buf != nullptr);
-
-    // Determine our conversion strategy
-    void* intermid = nullptr;                // pointer to a buffer that can hold the intermediate data (if needed)
-    bool need_quantized_conversion = false;  // flag indicating whether we need to qunatize the value extracted from TT later for GGML use
-    bool src_dst_same = false;               // If TT and GGML both have the same type - we can just memcpy
-
-    std::vector<std::byte> intermid_buf;     // In case we need it, some place to put data
-
-    // If both side is FP32
-    if(dst_ggtype == GGML_TYPE_F32 && !std::is_same_v<SrcType, float>) {
-        intermid = dst;
-        need_quantized_conversion = false;
-        src_dst_same = false;
-    }
-    // If both side are the same type fundimentally
-    // NOTE: Just putting the integer types here to remind me TT tensors can have integer types
-    else if ((std::is_same_v<SrcType, float> && dst_ggtype == GGML_TYPE_F32) ||
-             (std::is_same_v<SrcType, bfloat16> && dst_ggtype == GGML_TYPE_BF16) ||
-             (std::is_same_v<SrcType, int32_t> && dst_ggtype == GGML_TYPE_I32) ||
-             (std::is_same_v<SrcType, uint32_t> && dst_ggtype == GGML_TYPE_I32) ||
-             (std::is_same_v<SrcType, int16_t> && dst_ggtype == GGML_TYPE_I16) ||
-             (std::is_same_v<SrcType, int8_t> && dst_ggtype == GGML_TYPE_I8)) {
-        intermid = dst;
-        need_quantized_conversion = false;
-        src_dst_same = true;
-    }
-    // If both side are different - allocate the intermediate buffer and we need to convert
-    else {
-        intermid_buf.resize(shape.volume() * sizeof(float));
-        intermid = intermid_buf.data();
-        need_quantized_conversion = true;
-        src_dst_same = false;
-    }
+    // Let TTNN do the readback. `to_vector` brings the tensor back to host, untilizes it and strips
+    // the tile padding, handing back exactly `logical_shape().volume()` elements in row-major order.
+    //
+    // Do NOT go back to walking `host_storage().buffer()` by hand with strides derived from
+    // `padded_shape()`. That assumed the host buffer is a dense padded_shape-shaped array, which is
+    // not true: reading back a [3,3,16,32] conv weight that way returned 4563 of 4608 values wrong
+    // (CONV_2D nmse 6.87 -> 4.3e-5 after switching to to_vector). It also silently corrupted the CPU
+    // reference in ggml_backend_compare_graph_backend, which builds that reference by reading
+    // tensors back through this very function, so it presented as bogus CONV_2D failures.
+    //
+    // NOTE: `to_vector<T>` requires T to match the tensor's dtype, except for the block float
+    // formats (BFLOAT8_B / BFLOAT4_B) which require T == float. Every caller dispatches on
+    // `tensor.dtype()`, so that holds. The block float paths are not covered by the test suite.
+    const std::vector<SrcType> host_data = tensor.to_vector<SrcType>();
+    const size_t volume = tensor.logical_shape().volume();
+    GGML_ASSERT(host_data.size() == volume);
 
     auto src_adaptor = [](const SrcType& src) -> float {
         if constexpr(std::is_same_v<SrcType, bfloat16>) {
@@ -566,110 +528,34 @@ static void copy_tt_tensor_to_host_pointer(const ttnn::Tensor& tensor, void* dst
         GGML_UNREACHABLE();
     };
 
-    // Tilize to ROW_MAJOR doesn't mean the tensor is contiguous. It produces tensors that has 0 padded up to the nearest
-    // 32 elements on last two (for GGML first two) dimentions.
-    // Compute the stride for each dimension
-    std::array<size_t, 4> stride = {1, 1, 1, 1};
-    size_t cumulative_stride = 1;
-    for(int i = padded_shape.size() - 1; i >= 0; i--) {
-        stride[i] = cumulative_stride;
-        cumulative_stride *= padded_shape[i];
+    // Both sides hold the same thing fundamentally - straight copy
+    // NOTE: Just putting the integer types here to remind me TT tensors can have integer types
+    if((std::is_same_v<SrcType, float>    && dst_ggtype == GGML_TYPE_F32) ||
+       (std::is_same_v<SrcType, bfloat16> && dst_ggtype == GGML_TYPE_BF16) ||
+       (std::is_same_v<SrcType, uint32_t> && dst_ggtype == GGML_TYPE_I32)) {
+        memcpy(dst, host_data.data(), volume * sizeof(SrcType));
+        return;
     }
 
-    // Convert TT shape to GGML shape
-    std::array<size_t, 4> nshape {1, 1, 1, 1};
-    for(size_t i = 0; i < shape.size(); i++) {
-        nshape[4 - shape.size() + i] = shape[i];
+    // GGML wants FP32 but TT holds something else - widen straight into the destination
+    if(dst_ggtype == GGML_TYPE_F32) {
+        float* out = (float*)dst;
+        for(size_t i = 0; i < volume; i++) {
+            out[i] = src_adaptor(host_data[i]);
+        }
+        return;
     }
 
-    static_assert(GGML_MAX_DIMS == 4, "Looping depth is hardcoded to 4");
-    // Sanity check: src_dst_same shuld indicate there is no need for quantized conversion
-    GGML_ASSERT(((src_dst_same && !need_quantized_conversion) || !src_dst_same) && "src and dst should be the same type if src_dst_same is true");
-    // NOTE: The following optimizations are not full and has some slow paths taken unoptimally. But good enough for now
-
-    // Optimization: large block copy
-    // If  row major in TT is continous - memcpy it directly or (since we are converting from float) abuse the pointer
-    if(nshape[3] % 32 == 0 && ((nshape[0] == 1 && nshape[1] == 1) || nshape[2] % 32 == 0)) {
-        const size_t buf_size = std::accumulate(nshape.begin(), nshape.end(), 1, std::multiplies<size_t>());
-        // Both sides are same type - memcpy and call it a day
-        if(src_dst_same && !need_quantized_conversion) {
-            memcpy(dst, buf, sizeof(SrcType) * buf_size);
-            return;
-        }
-        // need conversion but TT side is already FP32 - pointer abuse
-        if(std::is_same_v<SrcType, float> && need_quantized_conversion) {
-            intermid = const_cast<void*>(static_cast<const void*>(buf));
-        }
-        // else we manually convert
-        else {
-            for(size_t i = 0; i < buf_size; i++) {
-                ((float*)intermid)[i] = src_adaptor(buf[i]);
-            }
-        }
+    // Everything else - convert to FP32 and let GGML narrow/quantize into the destination
+    GGML_ASSERT((ggml_is_quantized(dst_ggtype) || dst_ggtype == GGML_TYPE_F16 || dst_ggtype == GGML_TYPE_I32)
+        && "This block should only reach for quantized data types or FP16");
+    std::vector<float> intermid(volume);
+    for(size_t i = 0; i < volume; i++) {
+        intermid[i] = src_adaptor(host_data[i]);
     }
-    // If the 2nd dimension is not divisible by 32, we can still copy block by block
-    else if(nshape[0] % 32 == 0 && nshape[1] % 32 != 0) {
-        const size_t src_block_size = nshape[2] * nshape[3];
-        const size_t src_block_stride = stride[1];
-        if(src_dst_same) {
-            for(size_t i=0;i<nshape[0]*nshape[1];i++) {
-                memcpy((SrcType*)intermid + i * src_block_size, buf + i * src_block_stride, sizeof(SrcType) * src_block_size);
-            }
-        }
-        else {
-            for(size_t i=0;i<nshape[0]*nshape[1];i++) {
-                for(size_t j=0;j<src_block_size;j++) {
-                    ((SrcType*)intermid)[i * src_block_size + j] = src_adaptor(buf[i * src_block_stride + j]);
-                }
-            }
-        }
-    }
-    // row-by-row copy
-    // Only avoid small copies via memcpy if not copying into FP32 - we rely on raw copies for other types as the
-    // fallback loop asserts FP32
-    else if(src_dst_same && !need_quantized_conversion && (shape[3] >= 4 || !std::is_same_v<SrcType, float>)) {
-        const size_t dst_stride = nshape[3];
-        for(size_t i = 0; i < nshape[0] * nshape[1]; i++) {
-            for(size_t j = 0; j < nshape[2]; j++) {
-                // optimization: copy a row of memory at a time
-                const size_t src_idx = i * stride[1] + j * stride[2];
-                memcpy((SrcType*)intermid + j * dst_stride + i * nshape[2] * dst_stride, buf + src_idx, sizeof(SrcType) * nshape[3]);
-            }
-        }
-    }
-    // Slow path: src and dst are different types or the data is not contiguous in memory
-    else {
-        size_t idx = 0;
-        for(size_t w = 0; w < nshape[0]; w++) {
-            for(size_t z = 0; z < nshape[1]; z++) {
-                for(size_t y = 0; y < nshape[2]; y++) {
-                    for(size_t x = 0; x < nshape[3]; x++) {
-                        const size_t src_idx = w * stride[0] + z * stride[1] + y * stride[2] + x * stride[3];
-                        GGML_ASSERT(src_idx < buf_size);
-                        if(!src_dst_same) {
-                            ((float*)intermid)[idx] = src_adaptor(buf[src_idx]);
-                        }
-                        else {
-                            // memcpy((SrcType*)intermid + idx, buf + src_idx, sizeof(SrcType));
-                            const SrcType* src_ptr = buf + src_idx;
-                            SrcType* dst_ptr = (SrcType*)intermid + idx;
-                            *dst_ptr = *src_ptr;
-                        }
-                        idx++;
-                    }
-                }
-            }
-        }
-    }
-
-    if (need_quantized_conversion) {
-        GGML_ASSERT((ggml_is_quantized(dst_ggtype) || dst_ggtype == GGML_TYPE_F16 || dst_ggtype == GGML_TYPE_I32)
-            && "This block should only reach for quantized data types or FP16");
-        GGML_ASSERT(intermid_buf.size() != 0);
-        const ggml_type_traits_cpu* trait = ggml_get_type_traits_cpu(dst_ggtype);
-        GGML_ASSERT(trait->from_float != NULL);
-        trait->from_float((float*)intermid, dst, shape.volume());
-    }
+    const ggml_type_traits_cpu* trait = ggml_get_type_traits_cpu(dst_ggtype);
+    GGML_ASSERT(trait->from_float != NULL);
+    trait->from_float(intermid.data(), dst, volume);
 }
 
 static bool is_view(const ggml_tensor* tensor)
@@ -1712,21 +1598,19 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
             x = ttnn::add(x, mask);
         }
     }
-    // EXPERIMENT (GGML_METALIUM_FP32_NORM=1): same defect as ttnn::rms_norm -- with
-    // compute_kernel_config = nullopt the softmax reduction runs with fp32_dest_acc_en=false
-    // and math_approx_mode=true (EXP_APPROX), so every row's denominator is off by its own factor.
-    static const bool fp32_reduce = []() {
-        const char* v = std::getenv("GGML_METALIUM_FP32_NORM");
-        return v != nullptr && std::string(v) != "0";
-    }();
+    // With compute_kernel_config = nullopt the softmax device op defaults to
+    // math_approx_mode = true (EXP_APPROX=1) and fp32_dest_acc_en = false, so every row's
+    // denominator is off by its own factor. Measured on the softmax tests: nmse 5.11e-4 ->
+    // 3.21e-5 / 1.12e-4. This is on the path of every attention softmax, so pass the config
+    // explicitly rather than taking the device op's default.
+    // NOTE: fp32_dest_acc_en = true also halves DEST capacity, which can change ttnn's internal
+    // block sizing - a behavioural change, not only a precision one.
     const std::optional<const ttnn::DeviceComputeKernelConfig> sm_cfg =
-        fp32_reduce ? std::optional<const ttnn::DeviceComputeKernelConfig>(
-                          ttnn::WormholeComputeKernelConfig{
-                              .math_fidelity = MathFidelity::HiFi4,
-                              .math_approx_mode = false,
-                              .fp32_dest_acc_en = true,
-                              .packer_l1_acc = false})
-                    : std::nullopt;
+        ttnn::WormholeComputeKernelConfig{
+            .math_fidelity = MathFidelity::HiFi4,
+            .math_approx_mode = false,
+            .fp32_dest_acc_en = true,
+            .packer_l1_acc = false};
     x = ttnn::softmax(x, 3, std::nullopt, sm_cfg);
     *dst_meta = {
         .tensor = std::make_shared<ttnn::Tensor>(std::move(x)),
@@ -4057,6 +3941,74 @@ static const ggml_backend_device_i ggml_backend_metalium_device_interface = {
     /* .event_synchronize       = */ NULL,
 };
 
+// ---------------------------------------------------------------------------
+// Exit-time teardown
+//
+// GGML has no free hook for backend_reg / devices, so whatever holds our device contexts has to
+// release them on its own at process exit. Doing that from a std::atexit handler or a plain
+// function-local static is fatally too late on tt-metal: GraphTracker keeps its per-thread
+// processor stack in a *main-thread* thread_local (tt::tt_metal::GraphTracker::processors, see
+// tt-metalium/graph_tracking.hpp), and glibc destroys main-thread thread_locals BEFORE any atexit
+// handler or static destructor runs. Anything that destroys a ttnn::Tensor or a Program past that
+// point walks a destroyed std::vector:
+//     ~Program -> deallocate_circular_buffers -> GraphTracker::track_deallocate_cb -> SIGSEGV
+//
+// Two things keep us out of that window:
+//
+//  1. The MeshDevice is pinned for the lifetime of the process. ~MeshDeviceImpl is what tears down
+//     the program cache, and those cached Programs are exactly what reaches GraphTracker on the way
+//     out. Closing the device first does not help - the cache is only freed in ~MeshDeviceImpl,
+//     never in close(). Holding one reference forever means it simply never runs, which is the safe
+//     choice for a process-global device: the OS reclaims host memory and the KMD releases the
+//     hardware when the process exits. Other static holders (e.g. buffer_type_context_deleter) may
+//     drop their MeshDevice refs at exit; this pinned ref keeps the refcount >= 1 regardless.
+//
+//  2. Our own device contexts hang off a main-thread thread_local rather than a static, so they are
+//     released early - before static destructors run, and (see
+//     ggml_metalium_register_device_teardown) while GraphTracker's own thread_local is still alive.
+// ---------------------------------------------------------------------------
+
+struct ggml_metalium_device_teardown {
+    std::vector<std::unique_ptr<ggml_backend_metalium_device_context>> contexts;
+};
+
+static bool ggml_metalium_on_main_thread()
+{
+    // A thread_local is destroyed when *its* thread exits. That only coincides with process exit
+    // on the main thread.
+    return syscall(SYS_gettid) == (long)getpid();
+}
+
+// Keeps the MeshDevice alive for the lifetime of the process - see (1) above. Intentionally leaked:
+// a static vector would itself be destroyed during static destruction, which is the window we are
+// trying to stay out of.
+static void ggml_metalium_pin_device(const std::shared_ptr<ttnn::MeshDevice>& device)
+{
+    static auto* pinned = new std::vector<std::shared_ptr<ttnn::MeshDevice>>();
+    pinned->push_back(device);
+}
+
+// Takes ownership of `dev_ctx` and arranges for it to be destroyed as early as a clean process exit
+// allows - see (2) above.
+static void ggml_metalium_register_device_teardown(ggml_backend_metalium_device_context* dev_ctx)
+{
+    if(!ggml_metalium_on_main_thread()) {
+        // A thread_local registered here would be destroyed when *this* thread exits, which can be
+        // long before GGML is done with the backend. Leak instead; nothing in the teardown is load
+        // bearing, the pinned device in (1) is what actually prevents the crash.
+        return;
+    }
+
+    // Ordering: thread_local destructors run in reverse order of construction, and tt-metal
+    // registers GraphTracker::processors' destructor the first time that thread_local is touched.
+    // Touching it here, *before* ours is constructed, is what guarantees ours is destroyed first and
+    // therefore still sees a live GraphTracker.
+    (void)tt::tt_metal::GraphTracker::instance().is_enabled();
+
+    static thread_local ggml_metalium_device_teardown teardown;
+    teardown.contexts.push_back(std::unique_ptr<ggml_backend_metalium_device_context>(dev_ctx));
+}
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
 {
     static ggml_backend_reg reg;
@@ -4157,10 +4109,10 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
             .context = dev_ctx
         };
         ctx->devices.push_back(dev);
-        // GGML does not have free for backend_reg and devices. Will force free on exit (thanks to RAII) but Metalium
-        // already de-init at that point
-        static std::vector<std::unique_ptr<ggml_backend_metalium_device_context>> g_backend_device_holder;
-        g_backend_device_holder.push_back(std::unique_ptr<ggml_backend_metalium_device_context>(dev_ctx));
+        // GGML does not have free for backend_reg and devices - see the exit-time teardown notes
+        // above for why neither a static holder nor std::atexit can be used here.
+        ggml_metalium_pin_device(device);
+        ggml_metalium_register_device_teardown(dev_ctx);
 
         reg = ggml_backend_reg {
             /* .api_version = */ GGML_BACKEND_API_VERSION,

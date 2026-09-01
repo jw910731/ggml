@@ -86,9 +86,13 @@ inline void make_mask_internal(const uint32_t w, const uint32_t h, const int dst
     }
 
     math::clear_dst_reg_addr();
+    // Matches _llk_math_eltwise_sfpu_done_(): on Blackhole it is only
+    // clear_dst_reg_addr(); the STALLWAIT + clear_addr_mod_base pair is Wormhole only.
+    #ifndef ARCH_BLACKHOLE
     TTI_STALLWAIT(p_stall::STALL_CFG, p_stall::WAIT_SFPU);
     // math::clear_addr_mod_base();
     TTI_SETC16(2, 0); // equivalent to addr mod
+    #endif
 }
 
 void update_online_softmax_values_internal(const uint32_t dst_index_in0, const uint32_t dst_index_in1, const uint32_t dst_index_out) {
@@ -110,14 +114,14 @@ void update_online_softmax_values_internal(const uint32_t dst_index_in0, const u
         } v_endif;
 
         v_if(tile_mask == 1.f) {
-            sum = sum * _sfpu_exp_21f_bf16_<true>(max - new_max) + _sfpu_exp_21f_bf16_<true>(x - new_max);
+            sum = sum * _sfpu_exp_accurate_<true>(max - new_max) + _sfpu_exp_accurate_<true>(x - new_max);
         }
         v_endif;
         #else
         v_if(x > max) {
             new_max = x;
         } v_endif;
-        sum = sum * _sfpu_exp_21f_bf16_<true>(max - new_max) + _sfpu_exp_21f_bf16_<true>(x - new_max);
+        sum = sum * _sfpu_exp_accurate_<true>(max - new_max) + _sfpu_exp_accurate_<true>(x - new_max);
         #endif
 
         dst_reg[sum_base_idx] = sum;
@@ -142,11 +146,11 @@ void compute_result_for_online_softmax_internal(const uint32_t dst_index_in0, co
         vFloat res = 0;
         #ifdef NEED_TILE_MASK
         v_if(tile_mask == 1.f) {
-            res = _sfpu_exp_21f_bf16_<true>(x - x_max) * inv_sum;
+            res = _sfpu_exp_accurate_<true>(x - x_max) * inv_sum;
         }
         v_endif;
         #else
-        res = _sfpu_exp_21f_bf16_<true>(x - x_max) * inv_sum;
+        res = _sfpu_exp_accurate_<true>(x - x_max) * inv_sum;
         #endif
 
         dst_reg[in_base_idx] = res;
@@ -322,10 +326,10 @@ void kernel_main() {
             pack_reconfig_data_format(cb_tmp);
             reduce_init<PoolType::MAX, ReduceDim::REDUCE_ROW>(cb_max, cb_const1, cb_tmp);
             reduce_tile<PoolType::MAX, ReduceDim::REDUCE_ROW>(cb_max, cb_const1, 0, 0, 0);
-            reduce_uninit();
             tile_regs_commit();
             tile_regs_wait();
             pack_tile(0, cb_tmp);
+            reduce_uninit();
             tile_regs_release();
             cb_push_back(cb_tmp, 1);
 
@@ -371,16 +375,18 @@ void kernel_main() {
             tile_regs_acquire();
             cb_wait_front(cb_tmp2, 1);
             cb_reserve_back(cb_tmp, 1);
-            reconfig_data_format(cb_tmp2, cb_const1);
-            reconfig_data_format_srca(cb_tmp2);
-            reconfig_data_format_srcb(cb_const1);
+            // REDUCE_ROW SUM uses MVMUL with swapped operands (scaler -> SrcA, data -> SrcB),
+            // so the reconfig has to name them in that order. See reduce.h.
+            reconfig_data_format(cb_const1, cb_tmp2);
+            reconfig_data_format_srca(cb_const1);
+            reconfig_data_format_srcb(cb_tmp2);
             pack_reconfig_data_format(cb_tmp);
-            reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW, true>(cb_tmp2, cb_const1, cb_tmp);
-            reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW, true>(cb_tmp2, cb_const1, 0, 0, 0);
-            reduce_uninit();
+            reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_tmp2, cb_const1, cb_tmp);
+            reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_tmp2, cb_const1, 0, 0, 0);
             tile_regs_commit();
             tile_regs_wait();
             pack_tile(0, cb_tmp);
+            reduce_uninit();
             tile_regs_release();
             cb_push_back(cb_tmp, 1);
 
