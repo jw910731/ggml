@@ -207,9 +207,13 @@ inline void rope_tile(int pos, float inv_d, int vec_offset)
     }
 
     math::clear_dst_reg_addr();
+    // Matches _llk_math_eltwise_sfpu_done_(): on Blackhole it is only
+    // clear_dst_reg_addr(); the STALLWAIT + clear_addr_mod_base pair is Wormhole only.
+    #ifndef ARCH_BLACKHOLE
     TTI_STALLWAIT(p_stall::STALL_CFG, p_stall::WAIT_SFPU);
     // math::clear_addr_mod_base();
     TTI_SETC16(2, 0);  // semantically equivalent to above
+    #endif
 }
 
 
