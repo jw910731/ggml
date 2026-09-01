@@ -1418,6 +1418,161 @@ int main(int argc, char ** argv)
         ggml_tensor* mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1023, 31, 1, 1);
         return ggml_soft_max_ext(ctx, a, mask, 1, 0);
     }, "test softmax 1", 1e-5));
+
+    // ttprm fused view ops (-DGGML_METALIUM_TTPRM=ON).  These must pass identically
+    // whether or not the backend folds the view into the op, so they are ordinary
+    // graphs -- what they add is a binary op whose operand is a VIEW, which is the
+    // shape ttprm exists to fuse and which nothing else in this file exercises.
+    // Appended at the end so the shared RNG stream for every test above is unchanged.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 128);
+        ggml_tensor* v = ggml_view_2d(ctx, y, 64, 64, y->nb[1], y->nb[1] * 64);
+        return ggml_add(ctx, x, v);
+    }, "ADD with a viewed operand 64x64"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 128);
+        ggml_tensor* v = ggml_view_2d(ctx, y, 64, 64, y->nb[1], 0);
+        return ggml_mul(ctx, v, x);
+    }, "MUL with a viewed operand 64x64"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 128);
+        ggml_tensor* v = ggml_view_2d(ctx, y, 64, 64, y->nb[1], y->nb[1] * 64);
+        return ggml_sub(ctx, x, v);
+    }, "SUB with a viewed operand 64x64"));
+    // 3D destination: the fused result has to land in a rank-4 tiled tensor.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 32, 4);
+        ggml_tensor* y = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 32, 8);
+        ggml_tensor* v = ggml_view_3d(ctx, y, 32, 32, 4, y->nb[1], y->nb[2], y->nb[2] * 4);
+        return ggml_add(ctx, x, v);
+    }, "ADD with a viewed 3D operand"));
+    // Whole-tile group broadcast: the [32,32] operand is re-fed across the 4 batches.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 32, 4);
+        ggml_tensor* y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
+        ggml_tensor* v = ggml_view_2d(ctx, y, 32, 32, y->nb[1], y->nb[1] * 32);
+        return ggml_mul(ctx, x, v);
+    }, "MUL with a group-broadcast viewed operand"));
+    // Row broadcast into many rows: correct answer required, whichever path runs.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 128);
+        ggml_tensor* v = ggml_view_2d(ctx, y, 64, 1, y->nb[1], y->nb[1] * 2);
+        return ggml_add(ctx, x, v);
+    }, "ADD with a row-broadcast viewed operand"));
+
+    // Norm reducing out of a view (the other half of the ttprm fusion).
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 128);
+        ggml_tensor* v = ggml_view_2d(ctx, y, 64, 64, y->nb[1], y->nb[1] * 64);
+        return ggml_rms_norm(ctx, v, 1e-6f);
+    }, "RMSNorm on a viewed operand 64x64"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 128);
+        ggml_tensor* v = ggml_view_2d(ctx, y, 64, 64, y->nb[1], y->nb[1] * 64);
+        return ggml_norm(ctx, v, 1e-5f);
+    }, "LayerNorm on a viewed operand 64x64"));
+
+    // A 3D view whose WIDTH is face-aligned (48) but not tile-aligned, over a tile-aligned
+    // row count. Non-trivial batch dims rule out a rank extension, so the only way to fuse
+    // this is to bind a rank-4 output -- which only needs the ROW count tile-aligned.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* y = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 64, 8);
+        ggml_tensor* v = ggml_view_3d(ctx, y, 48, 64, 4, y->nb[1], y->nb[2], y->nb[2] * 2);
+        return ggml_cont(ctx, v);
+    }, "CONT of a 48-wide 3D view (non-tile-aligned width)"));
+
+    // Pad-lane probes. The 48-wide result above only covers lanes 0..47 of its last column
+    // tile, and the matmul kernel iterates the full padded K (Kt = ceil(K/32), no masking),
+    // so what lands in lanes 48..63 matters. mul_mat alone cannot prove it: the other
+    // operand is uploaded through tilize_with_zero_padding, so its zero pads annihilate the
+    // product whatever the suspect tensor holds. A SUM reduction has no such luck, hence the
+    // rms_norm probe -- keep both, the matmul one still guards the shape plumbing.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* y = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 64, 8);
+        ggml_tensor* v = ggml_cont(ctx, ggml_view_2d(ctx, y, 48, 64, y->nb[1], 0));
+        ggml_tensor* w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 48, 32);
+        return ggml_mul_mat(ctx, w, v);
+    }, "MatMul over a 48-wide realized view (pad-lane probe)"));
+
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* y = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 64, 8);
+        ggml_tensor* v = ggml_cont(ctx, ggml_view_2d(ctx, y, 48, 64, y->nb[1], 0));
+        return ggml_rms_norm(ctx, v, 1e-6f);   // sum of squares over a padded row
+    }, "RMSNorm over a 48-wide realized view (pad-lane probe)"));
+
+    // The decisive one: BOTH matmul operands are realized views of non-tile-aligned width,
+    // so neither brings zeroed pad lanes to annihilate the other's. If a realized view can
+    // leave lanes 48..63 uninitialized, the K-tail term is garbage*garbage and this fails.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* y = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 64, 8);
+        ggml_tensor* a = ggml_cont(ctx, ggml_view_2d(ctx, y, 48, 32, y->nb[1], 0));
+        ggml_tensor* b = ggml_cont(ctx, ggml_view_2d(ctx, y, 48, 64, y->nb[1], y->nb[1] * 64));
+        return ggml_mul_mat(ctx, a, b);
+    }, "MatMul of two 48-wide realized views (pad x pad probe)"));
+
+    // Padded bases. TTNN pads the last two dims, so these two shapes used to be refused
+    // outright: a base whose LANE width is not a tile multiple (48 -> 64), and a base whose
+    // ROW count is not (10 -> 32) across several batch blocks. Both are addressable by
+    // walking physical rows with a stride instead of the flat element stream.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* y = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 48, 64, 8);
+        ggml_tensor* v = ggml_view_2d(ctx, y, 48, 64, y->nb[1], y->nb[1] * 64);
+        return ggml_cont(ctx, v);
+    }, "CONT of a view over a lane-padded base (48-wide)"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* y = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 10, 4);
+        ggml_tensor* v = ggml_view_2d(ctx, y, 64, 10, y->nb[1], y->nb[2] * 2);
+        return ggml_cont(ctx, v);
+    }, "CONT of a per-block view over a row-padded base"));
+
+    // Output rows not tile-aligned, across several batch blocks: the packed [244,64] result
+    // has to land in a [1,2,122,64] tensor whose 122 rows pad to 128 per block, which is only
+    // reachable through a 2-level (GROUPED) scatter.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 488);
+        ggml_tensor* v = ggml_view_3d(ctx, y, 64, 122, 2, y->nb[1], y->nb[1] * 122, y->nb[1] * 244);
+        return ggml_cont(ctx, v);
+    }, "CONT of a view whose result rows are not tile-aligned"));
+
+    // Same non-tile-aligned row count, now through the fused binary and norm paths, so the
+    // grouped scatter is exercised by every op that binds an output rather than realize alone.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 122, 2);
+        ggml_tensor* y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 488);
+        ggml_tensor* v = ggml_view_3d(ctx, y, 64, 122, 2, y->nb[1], y->nb[1] * 122, y->nb[1] * 244);
+        return ggml_add(ctx, x, v);
+    }, "ADD whose result rows are not tile-aligned"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 488);
+        ggml_tensor* v = ggml_view_3d(ctx, y, 64, 122, 2, y->nb[1], y->nb[1] * 122, y->nb[1] * 244);
+        return ggml_rms_norm(ctx, v, 1e-6f);
+    }, "RMSNorm whose result rows are not tile-aligned"));
+
+    // The z-image QKV split, scaled down: a fused [3*H*D, L] projection viewed as
+    // [D, H, L]. Its outer strides do not nest -- k(r) = 3*H*D*(r/H) + D*(r%H) -- which is
+    // the 2-level row map, not an affine one.
+    auto qkv_split = [](int64_t D, int64_t H, int64_t L, const char* name, int64_t which) {
+        return make_test([=](ggml_context* ctx) {
+            ggml_tensor* qkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * H * D, L);
+            ggml_tensor* v = ggml_view_3d(ctx, qkv, D, H, L,
+                                          qkv->nb[0] * D, qkv->nb[1],
+                                          qkv->nb[0] * D * H * which);
+            return ggml_cont(ctx, v);
+        }, name);
+    };
+    tests.push_back(qkv_split(128, 30, 64, "CONT of a QKV-split view (2-level row map)", 0));
+    tests.push_back(qkv_split(128, 30, 64, "CONT of a QKV-split view, offset (2-level)", 1));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* qkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * 30 * 128, 64);
+        ggml_tensor* v = ggml_view_3d(ctx, qkv, 128, 30, 64,
+                                      qkv->nb[0] * 128, qkv->nb[1], 0);
+        return ggml_rms_norm(ctx, v, 1e-6f);
+    }, "RMSNorm over a QKV-split view (2-level row map)"));
+
     ///////////////// end of experiment code /////////////////
 
     size_t total_tests = 0;
