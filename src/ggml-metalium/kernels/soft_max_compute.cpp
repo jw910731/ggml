@@ -74,8 +74,7 @@ inline void make_mask_face(const int w, const int h, const int dst_tile_id) {
 }
 
 inline void make_mask_internal(const uint32_t w, const uint32_t h, const int dst_tile_id) {
-    math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::SrcRegs>(0);
-    TTI_STALLWAIT(p_stall::STALL_SFPU, p_stall::MATH);
+    _llk_math_eltwise_sfpu_start_(0);
 
     for (int face = 0; face < 4; face++) {
         int x = (face % 2) * 16;
@@ -85,14 +84,7 @@ inline void make_mask_internal(const uint32_t w, const uint32_t h, const int dst
         TTI_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D);
     }
 
-    math::clear_dst_reg_addr();
-    // Matches _llk_math_eltwise_sfpu_done_(): on Blackhole it is only
-    // clear_dst_reg_addr(); the STALLWAIT + clear_addr_mod_base pair is Wormhole only.
-    #ifndef ARCH_BLACKHOLE
-    TTI_STALLWAIT(p_stall::STALL_CFG, p_stall::WAIT_SFPU);
-    // math::clear_addr_mod_base();
-    TTI_SETC16(2, 0); // equivalent to addr mod
-    #endif
+    _llk_math_eltwise_sfpu_done_()
 }
 
 void update_online_softmax_values_internal(const uint32_t dst_index_in0, const uint32_t dst_index_in1, const uint32_t dst_index_out) {

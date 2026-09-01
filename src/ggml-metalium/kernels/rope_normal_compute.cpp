@@ -102,8 +102,7 @@ inline void rope_face(int pos, int D, int vec_offset, int face)
 
 inline void rope_tile(int pos, int D, int vec_offset)
 {
-    math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::SrcRegs>(0);
-    TTI_STALLWAIT(p_stall::STALL_SFPU, p_stall::MATH);
+    _llk_math_eltwise_sfpu_start_(0);
 
     #ifdef HAS_FREQ_FACTOR
     // Seperate computation of inverse of freq_factor as otherwise SFPI fails to compile due to
@@ -168,14 +167,7 @@ inline void rope_tile(int pos, int D, int vec_offset)
         rope_face(pos, D, vec_offset + ((face % 2 == 0) ? 0 : 16), face);
     }
 
-    math::clear_dst_reg_addr();
-    // Matches _llk_math_eltwise_sfpu_done_(): on Blackhole it is only
-    // clear_dst_reg_addr(); the STALLWAIT + clear_addr_mod_base pair is Wormhole only.
-    #ifndef ARCH_BLACKHOLE
-    TTI_STALLWAIT(p_stall::STALL_CFG, p_stall::WAIT_SFPU);
-    // math::clear_addr_mod_base();
-    TTI_SETC16(2, 0); // semantically equivalent to above
-    #endif
+    _llk_math_eltwise_sfpu_done_();
 }
 
 inline void rope_tile_init(float inv_d)
