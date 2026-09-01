@@ -87,6 +87,47 @@ if(GGML_METALIUM_EMBED_KERNELS)
 endif()
 
 
+# ttPseudoRowMajor (ttprm) -- fused, view-aware TTNN ops. Opt-in.
+#
+# We deliberately do NOT add_subdirectory() the submodule: its own CMakeLists
+# declares `ttmetal`/`ttnnlib` IMPORTED INTERFACE targets and pulls fmt/yaml-cpp/
+# Boost/CLI11 through CPM, all of which overlap-but-differ from the include/link
+# set this backend already carries. Instead we compile the single TU that links
+# TTNN (view_realize_op.cpp) straight into ggml-metalium and reuse our own flags.
+if(GGML_METALIUM_TTPRM)
+    set(TTPRM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../thirdparty/ttPseudoRowMajor/ttprm")
+    if(NOT EXISTS "${TTPRM_DIR}/view_realize_op.cpp")
+        message(FATAL_ERROR
+            "GGML_METALIUM_TTPRM=ON but ${TTPRM_DIR} is empty. "
+            "Run: git submodule update --init --recursive")
+    endif()
+    message(STATUS "Metalium: ttprm fused view ops enabled (${TTPRM_DIR})")
+
+    target_sources(ggml-metalium PRIVATE
+        "${TTPRM_DIR}/view_realize_op.cpp"
+        ttprm_bridge.cpp
+    )
+    target_include_directories(ggml-metalium PRIVATE "${TTPRM_DIR}")
+    # TTPRM_ROOT is a *runtime* dependency: the device kernels are JIT-compiled
+    # from ${TTPRM_ROOT}/kernel/*.cpp, so the source tree must still be present
+    # when sd-cli runs. Embedding them the way GGML_METALIUM_EMBED_KERNELS does
+    # for this backend's own kernels would need ttprm-side changes.
+    #
+    # Those kernels are also not all current: against tt-metal v0.78.0-dev the realize
+    # and eltwise kernels build, but view_norm_compute.cpp does not
+    # (ckernel::math::set_addr_mod_base is gone). The bridge latches an entry point off
+    # after its first device-side failure, so a stale kernel costs one failed JIT build
+    # per process rather than one per node.
+    target_compile_definitions(ggml-metalium PRIVATE
+        GGML_METALIUM_TTPRM
+        TTPRM_ROOT="${TTPRM_DIR}")
+    # ttprm's TU has its own `using namespace` block; keep our PCH off it, and
+    # force-include the shim that restores the TTNN spellings it was written for.
+    set_source_files_properties("${TTPRM_DIR}/view_realize_op.cpp" PROPERTIES
+        SKIP_PRECOMPILE_HEADERS ON
+        COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/ttprm_compat.hpp")
+endif()
+
 target_compile_definitions(
     ggml-metalium PRIVATE
     FMT_HEADER_ONLY

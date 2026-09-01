@@ -1,0 +1,6 @@
+[submodule "thirdparty/ttPseudoRowMajor"]
+	path = thirdparty/ttPseudoRowMajor
+	url = https://github.com/jw910731/ttPseudoRowMajor.git
+[submodule "ttPseudoRowMajor"]
+	path = ttPseudoRowMajor
+	url = https://github.com/jw910731/ttPseudoRowMajor.git

@@ -7,6 +7,10 @@
 #include "ggml-cpu.h"
 #include "ggml-metalium.h"
 
+#ifdef GGML_METALIUM_TTPRM
+#include "ttprm_bridge.hpp"
+#endif
+
 #include "hostdevcommon/common_values.hpp"
 #include "tt-metalium/bfloat16.hpp"
 #include "tt-metalium/host_buffer.hpp"
@@ -142,6 +146,26 @@ static bool ggml_tt_tensors_shape_equal(const ggml_tensor* ggtensor, const ttnn:
     }
     return true;
 }
+
+#ifdef GGML_METALIUM_TTPRM
+// Hands the ttprm bridge the tensor already materialized for `node` without
+// exposing ggml_tensor_extra_metalium, which is private to this file. Nodes that
+// have no tensor of their own return nullptr so the bridge keeps walking src[0],
+// exactly like realize_ggml_view_impl() does.
+const ttnn::Tensor* ggml_metalium_materialized_tensor(const ggml_tensor* node)
+{
+    const ggml_tensor_extra_metalium* meta = (const ggml_tensor_extra_metalium*)node->extra;
+    if(meta == nullptr || meta->tensor == nullptr) {
+        return nullptr;
+    }
+    // A pre-transposed weight holds the transpose of what GGML describes, so its
+    // flat element order does not match the strides the bridge folds.
+    if(meta->is_pretransposed || !ggml_tt_tensors_shape_equal(node, *meta->tensor)) {
+        return nullptr;
+    }
+    return meta->tensor.get();
+}
+#endif
 
 static void dump_ggml_tensor_meta(const ggml_tensor* ggtensor)
 {
@@ -629,6 +653,18 @@ static std::shared_ptr<ttnn::Tensor> realize_ggml_view_impl(const ggml_tensor* t
         return std::make_shared<ttnn::Tensor>(res);
     }
     if(op == GGML_OP_VIEW) {
+#ifdef GGML_METALIUM_TTPRM
+        // A view that is really a reshape is metadata-only for TTNN, so ttprm's
+        // gather would be strictly more expensive than what we already do. Offer
+        // it only the views that currently cost a slice -- and usually a reshape
+        // on one or both sides of it.
+        if(!keep_block_float &&
+           !(tensor->view_offs == 0 && ggml_nelements(src0) == ggml_nelements(tensor))) {
+            if(auto fused = ggml_ttprm::realize_view(tensor)) {
+                return fused;
+            }
+        }
+#endif
         // Resolve the parent via src0 (the immediate producer), NOT view_src.  ggml
         // collapses view_src PAST in-place ops (ggml_add_inplace, ggml_mul_inplace, ...)
         // to the underlying base buffer, but this backend does no true in-place compute:
@@ -1151,6 +1187,18 @@ static void ggml_backend_metalium_bin_op(ggml_backend_metalium_context * ctx, st
     const struct ggml_tensor * src1 = dst->src[1];
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
 
+#ifdef GGML_METALIUM_TTPRM
+    // realize(src0) + realize(src1) + ttnn::<op> is three dispatches and two
+    // intermediate DRAM tensors. ttprm takes both operands as views, so the whole
+    // thing collapses into one program with no intermediates.
+    if(auto fused = ggml_ttprm::bin_op(dst, op)) {
+        *dst_meta = {
+            .tensor = std::move(fused),
+        };
+        return;
+    }
+#endif
+
     auto src_tensor0 = realize_ggml_view(src0);
     auto src_tensor1 = realize_ggml_view(src1);
 
@@ -1417,6 +1465,19 @@ static void ggml_backend_metalium_norm(ggml_backend_metalium_context * ctx, stru
 
     float esp = 0;
     memcpy(&esp, dst->op_params, sizeof(esp));
+
+#ifdef GGML_METALIUM_TTPRM
+    // Same idea as bin_op: with a viewed source, realize + normalize is two dispatches
+    // and an intermediate. ttprm reduces straight out of the view.
+    if(dst->ne[0] > 1) {
+        if(auto fused = ggml_ttprm::norm(dst, rms, esp)) {
+            *dst_meta = {
+                .tensor = std::move(fused),
+            };
+            return;
+        }
+    }
+#endif
 
     // HACK: the norm implementations in TTNN does not like size 1 tensors - we know the result is going to be sign(x)
     // so let's just make that
