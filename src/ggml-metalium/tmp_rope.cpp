@@ -69,8 +69,8 @@ void rope_device::RoPEDeviceOperation::validate_on_program_cache_miss(
         index_tensor.dtype() == tt::tt_metal::DataType::UINT32, "Index tensor must be of type (U)INT32");
     TT_FATAL(src_tensor.layout() == tt::tt_metal::Layout::TILE, "Source tensor must be of layout TILE");
     TT_FATAL(index_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR, "Index tensor must be of layout ROW_MAJOR");
-    TT_FATAL(index_tensor.storage_type() == tt::tt_metal::StorageType::DEVICE, "Index tensor must be on device");
-    TT_FATAL(src_tensor.storage_type() == tt::tt_metal::StorageType::DEVICE, "Source tensor must be on device");
+    TT_FATAL(index_tensor.storage_type() == ttnn::StorageType::DEVICE, "Index tensor must be on device");
+    TT_FATAL(src_tensor.storage_type() == ttnn::StorageType::DEVICE, "Source tensor must be on device");
 
     if (tensor_args.freq_factor.has_value()) {
         const auto& freq_factor = tensor_args.freq_factor.value();

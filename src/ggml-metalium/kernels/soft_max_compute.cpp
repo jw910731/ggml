@@ -35,7 +35,7 @@ using namespace ckernel::sfpu;
 inline void make_mask_face(const int w, const int h, const int dst_tile_id) {
     const int write_offset = dst_tile_id * 32;
     if(w <= 0 || h <= 0) {
-        #pragma unroll 0
+        #pragma GCC unroll 0
         for(int i=0; i<8; i++) {
             dst_reg[write_offset] = vFloat(0.f);
             dst_reg++;
@@ -43,7 +43,7 @@ inline void make_mask_face(const int w, const int h, const int dst_tile_id) {
         return;
     }
     if(w >= 16 && h >= 16) {
-        #pragma unroll 0
+        #pragma GCC unroll 0
         for(int i=0; i<8; i++) {
             dst_reg[write_offset] = vFloat(1.f);
             dst_reg++;
@@ -74,7 +74,7 @@ inline void make_mask_face(const int w, const int h, const int dst_tile_id) {
 }
 
 inline void make_mask_internal(const uint32_t w, const uint32_t h, const int dst_tile_id) {
-    math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::SrcRegs>(dst_index);
+    math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::SrcRegs>(0);
     TTI_STALLWAIT(p_stall::STALL_SFPU, p_stall::MATH);
 
     for (int face = 0; face < 4; face++) {
@@ -110,14 +110,14 @@ void update_online_softmax_values_internal(const uint32_t dst_index_in0, const u
         } v_endif;
 
         v_if(tile_mask == 1.f) {
-            sum = sum * _sfpu_exp_21f_<true>(max - new_max) + _sfpu_exp_21f_<true>(x - new_max);
+            sum = sum * _sfpu_exp_21f_bf16_<true>(max - new_max) + _sfpu_exp_21f_bf16_<true>(x - new_max);
         }
         v_endif;
         #else
         v_if(x > max) {
             new_max = x;
         } v_endif;
-        sum = sum * _sfpu_exp_21f_<true>(max - new_max) + _sfpu_exp_21f_<true>(x - new_max);
+        sum = sum * _sfpu_exp_21f_bf16_<true>(max - new_max) + _sfpu_exp_21f_bf16_<true>(x - new_max);
         #endif
 
         dst_reg[sum_base_idx] = sum;
@@ -142,11 +142,11 @@ void compute_result_for_online_softmax_internal(const uint32_t dst_index_in0, co
         vFloat res = 0;
         #ifdef NEED_TILE_MASK
         v_if(tile_mask == 1.f) {
-            res = _sfpu_exp_21f_<true>(x - x_max) * inv_sum;
+            res = _sfpu_exp_21f_bf16_<true>(x - x_max) * inv_sum;
         }
         v_endif;
         #else
-        res = _sfpu_exp_21f_<true>(x - x_max) * inv_sum;
+        res = _sfpu_exp_21f_bf16_<true>(x - x_max) * inv_sum;
         #endif
 
         dst_reg[in_base_idx] = res;
@@ -161,11 +161,11 @@ void compute_result_for_online_softmax_internal(const uint32_t dst_index_in0, co
 // ============================================================================
 
 static void update_online_softmax_values() {
-    MATH(_llk_math_eltwise_binary_sfpu_params_<false>(update_online_softmax_values_internal, 0, 1, 2));
+    MATH(_llk_math_eltwise_binary_sfpu_params_(update_online_softmax_values_internal, 0, 1, 2));
 }
 
 static void compute_result_for_online_softmax() {
-    MATH(_llk_math_eltwise_binary_sfpu_params_<false>(compute_result_for_online_softmax_internal, 1, 2, 0));
+    MATH(_llk_math_eltwise_binary_sfpu_params_(compute_result_for_online_softmax_internal, 1, 2, 0));
 }
 
 static void make_mask(const int w, const int h, const int dst_tile_id) {

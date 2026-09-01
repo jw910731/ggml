@@ -49,7 +49,6 @@ target_link_directories(ggml-metalium PRIVATE
 target_link_libraries(ggml-metalium PRIVATE
     # Metalium
     tt_metal
-    yaml-cpp
 
     # TTNN
     $ENV{TT_METAL_HOME}/build/ttnn/_ttnncpp.so
