@@ -1,4 +1,6 @@
 #include "tmp_mul_mat.hpp"
+#include <cstdlib>
+#include <string>
 #include "tt-metalium/core_coord.hpp"
 #include "tt-metalium/host_api.hpp"
 #include "tt-metalium/kernel_types.hpp"
@@ -158,8 +160,15 @@ mul_mat_device::program::MulMatProgramFactory::create(
         .named_compile_args = {}
     });
 
+    // SD_TENSOR_DUMP/EXPERIMENT: GGML_METALIUM_FP32_ACC=1 forces fp32 DEST accumulation for
+    // every matmul, not just the ones GGML tagged GGML_PREC_F32.
+    static const bool force_fp32_acc = []() {
+        const char* v = std::getenv("GGML_METALIUM_FP32_ACC");
+        return v != nullptr && std::string(v) != "0";
+    }();
+
     KernelHandle compute = CreateMetaliumKernel(program, "mul_mat_compute", all_cores, ComputeConfig{
-        .fp32_dest_acc_en = operation_attributes.high_percision,
+        .fp32_dest_acc_en = operation_attributes.high_percision || force_fp32_acc,
         .unpack_to_dest_mode = {},
         .compile_args = {},
         .defines = {},

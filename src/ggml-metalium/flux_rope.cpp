@@ -55,8 +55,8 @@ void flux_rope_device::FluxRoPEDeviceOperation::validate_on_program_cache_miss(
 
     TT_FATAL(src.layout() == tt::tt_metal::Layout::TILE, "Source tensor must be TILE layout");
     TT_FATAL(pe.layout() == tt::tt_metal::Layout::TILE, "PE tensor must be TILE layout");
-    TT_FATAL(src.storage_type() == tt::tt_metal::StorageType::DEVICE, "Source must be on device");
-    TT_FATAL(pe.storage_type() == tt::tt_metal::StorageType::DEVICE, "PE must be on device");
+    TT_FATAL(src.storage_type() == ttnn::StorageType::DEVICE, "Source must be on device");
+    TT_FATAL(pe.storage_type() == ttnn::StorageType::DEVICE, "PE must be on device");
 
     const auto& src_shape = src.logical_shape();
     const auto& pe_shape = pe.logical_shape();

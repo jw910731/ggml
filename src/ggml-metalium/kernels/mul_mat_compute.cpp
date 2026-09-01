@@ -19,7 +19,8 @@ void kernel_main() {
     constexpr uint32_t cb_in1 = tt::CBIndex::c_1;
     constexpr uint32_t cb_out0 = tt::CBIndex::c_16;
 
-    mm_init(cb_in1, cb_in0, cb_out0, true);
+    compute_kernel_hw_startup<SrcOrder::Reverse>(cb_in1, cb_in0, cb_out0);
+    matmul_init(cb_in1, cb_in0, true);
     for(uint32_t work_id = id; work_id < id + size; work_id++) {
         tile_regs_acquire();
         for(uint32_t k = 0; k < Kt; ++k) {
