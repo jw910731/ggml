@@ -76,6 +76,8 @@
 
 #include <memory>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "tmp_rope.hpp"
@@ -104,6 +106,14 @@ struct ggml_backend_metalium_reg_context {
 
 struct ggml_tensor_extra_metalium;
 
+// The ggml address range of a tensor whose device memory a compute buffer holds (see ggml_metalium_release_range).
+struct ggml_metalium_live_range {
+    uintptr_t begin;
+    uintptr_t end;
+    const ggml_tensor * family; // compared only; never dereferenced
+    ggml_tensor_extra_metalium * extra;
+};
+
 struct ggml_backend_metalium_buffer_context {
 
     size_t ggml_buffer_size_bytes = 0;
@@ -113,12 +123,21 @@ struct ggml_backend_metalium_buffer_context {
 
     // Tracking our own allocations because Metalium limitations and GGML assuming them
     std::vector<std::unique_ptr<ggml_tensor_extra_metalium>> metadata_to_free;
+
+    std::vector<ggml_metalium_live_range> live_ranges;
+    std::mutex live_ranges_mutex;
+    // Uses still pending in the graph being computed (see ggml_metalium_release_use), and the nodes
+    // computed into this buffer since those counts started
+    std::unordered_map<const ggml_tensor *, int32_t> remaining_uses;
+    std::unordered_set<const ggml_tensor *> produced;
 };
 
 struct ggml_tensor_extra_metalium
 {
     std::shared_ptr<ttnn::Tensor> tensor;
     bool is_pretransposed = false;
+    // A 4D kernel kept ROW_MAJOR as [1, 1, rows, row] instead of its ggml shape (see set_tensor)
+    bool is_flat_kernel = false;
 };
 
 static bool ggml_tt_tensors_shape_equal(const ggml_tensor* ggtensor, const ttnn::Tensor& ttensor)
@@ -275,7 +294,7 @@ static size_t g_metalium_base_offset = 0;
 static tt::tt_metal::DataType ggml2tt_type_internal(ggml_type ggtype, tt::ARCH arch) {
     // This table is consulted to map GGML types to TT types dueing tensor creation
     if(arch == tt::ARCH::WORMHOLE_B0 || arch == tt::ARCH::BLACKHOLE) {
-        static constexpr std::array<tt::tt_metal::DataType, GGML_TYPE_COUNT> table = {
+        static constexpr auto table = std::to_array<tt::tt_metal::DataType>({
             /*GGML_TYPE_F32        = */ tt::tt_metal::DataType::BFLOAT16,
             /*GGML_TYPE_F16        = */ tt::tt_metal::DataType::BFLOAT16,
             // NOTE: BFLOAT4_B (4-bit block float) is fully supported by this backend (storage,
@@ -321,7 +340,15 @@ static tt::tt_metal::DataType ggml2tt_type_internal(ggml_type ggtype, tt::ARCH a
             /*GGML_TYPE_IQ4_NL_4_8 = */ tt::tt_metal::DataType::INVALID, // Support removed from GGML
             /*GGML_TYPE_IQ4_NL_8_8 = */ tt::tt_metal::DataType::INVALID, // Support removed from GGML
             /*GGML_TYPE_MXFP4      = */ tt::tt_metal::DataType::INVALID,
-        };
+            /*GGML_TYPE_NVFP4      = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_Q1_0       = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_Q2_0       = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_F8_E4M3    = */ tt::tt_metal::DataType::BFLOAT16, // exact: BF16 covers FP8's exponent and mantissa
+            /*GGML_TYPE_F8_E5M2    = */ tt::tt_metal::DataType::BFLOAT16,
+        });
+        // std::array value-initializes missing entries to DataType{0} (BFLOAT16), so a table that
+        // falls behind a new ggml_type would silently claim support for it.
+        static_assert(table.size() == GGML_TYPE_COUNT, "ggml2tt table is out of sync with ggml_type");
         // safeguard against OOB read from outdated table
         if(ggtype >= table.size()) {
             return tt::tt_metal::DataType::INVALID;
@@ -871,6 +898,21 @@ static std::shared_ptr<ttnn::Tensor> realize_ggml_view_impl(const ggml_tensor* t
             permute_tt_real[permute_tt[i]] = i;
         }
 
+        // A permutation that keeps every non-unit axis in order only moves size-1 axes, so the
+        // element order is unchanged: it is a reshape, not a full-size (and often tile-padded) copy.
+        const auto & in_shape = t->logical_shape();
+        bool moves_only_unit_axes = in_shape.rank() == GGML_MAX_DIMS && ggml_tt_tensors_shape_equal(src0, *t);
+        for(int k = 0, prev = -1; moves_only_unit_axes && k < GGML_MAX_DIMS; k++) {
+            const int d = (int)permute_tt_real[k];
+            if(in_shape[d] != 1) {
+                moves_only_unit_axes = d > prev;
+                prev = d;
+            }
+        }
+        if(moves_only_unit_axes) {
+            return std::make_shared<ttnn::Tensor>(reshape_tt_tensor_into_ggml(*t, tensor));
+        }
+
         auto res = ttnn::permute(*t, permute_tt_real);
         return std::make_shared<ttnn::Tensor>(std::move(res));
     }
@@ -883,6 +925,9 @@ static std::shared_ptr<ttnn::Tensor> realize_ggml_view_impl(const ggml_tensor* t
         if(!keep_block_float && tt_dtype_is_block_float(meta->tensor->dtype())) {
             return std::make_shared<ttnn::Tensor>(
                 ttnn::typecast(*meta->tensor, tt::tt_metal::DataType::BFLOAT16));
+        }
+        if(meta->is_flat_kernel) {
+            return std::make_shared<ttnn::Tensor>(reshape_tt_tensor_into_ggml(*meta->tensor, tensor));
         }
         return meta->tensor;
     }
@@ -1051,6 +1096,30 @@ static bool ggml_backend_metalium_can_cpy(const struct ggml_tensor * dst)
     return !(ggml_is_permuted(src1) || is_view(src1));
 }
 
+// Whether res is backed by the same device Buffer as a tensor realize_ggml_view(src) may have
+// returned as-is (the leaf itself, a no-op permute). A ttnn view (e.g. a view-reshape) gets its own
+// Buffer over the source allocation and is not caught; sharing that is harmless, since device
+// tensors are never written in place here, and it pins no more memory than a copy would.
+static bool ggml_metalium_aliases_source(const ttnn::Tensor & res, const ggml_tensor * src) {
+    if (res.storage_type() != ttnn::StorageType::DEVICE || !res.is_allocated()) {
+        return true;
+    }
+    const tt::tt_metal::Buffer * storage = res.buffer();
+    for (const ggml_tensor * t = src; t != nullptr;
+         t = (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
+              t->op == GGML_OP_TRANSPOSE) ? t->src[0] : nullptr) {
+        for (const ggml_tensor * u : std::array<const ggml_tensor *, 2>{t, t->view_src}) {
+            const auto * meta = u != nullptr ? (const ggml_tensor_extra_metalium *)u->extra : nullptr;
+            if (meta != nullptr && meta->tensor != nullptr &&
+                meta->tensor->storage_type() == ttnn::StorageType::DEVICE && meta->tensor->is_allocated() &&
+                meta->tensor->buffer() == storage) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
     GGML_UNUSED(ctx);
     // Don't need sanity check since the copy is lazy
@@ -1073,8 +1142,11 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
     // Without this, res aliases the source's device buffer via shared_ptr, preventing
     // the source from being deallocated when its last GGML consumer finishes.
     // Using typecast to the same dtype forces TTNN to allocate a new device buffer.
-    auto copied = std::make_shared<ttnn::Tensor>(
-        ttnn::typecast(*res, res->dtype()));
+    // A res that realize() had to materialize is already independent; copying it again
+    // would hold two full-size tensors at once.
+    auto copied = ggml_metalium_aliases_source(*res, src0)
+        ? std::make_shared<ttnn::Tensor>(ttnn::typecast(*res, res->dtype()))
+        : res;
 
     if(dst->op == GGML_OP_CPY) {
         auto* src1 = dst->src[1];
@@ -2599,6 +2671,20 @@ static void ggml_backend_metalium_upscale(ggml_backend_metalium_context * ctx, s
     };
 }
 
+// A flat kernel (see set_tensor) reaches the conv only through RESHAPEs. Read it back whole and give it
+// the conv shape on the host, where relabelling ROW_MAJOR data is free.
+static std::optional<ttnn::Tensor> ggml_metalium_flat_kernel_on_host(const ggml_tensor * w, const ttnn::Shape & shape) {
+    const ggml_tensor * leaf = w;
+    while (leaf->op == GGML_OP_RESHAPE && leaf->src[0] != nullptr) {
+        leaf = leaf->src[0];
+    }
+    const auto * meta = (const ggml_tensor_extra_metalium *)leaf->extra;
+    if (meta == nullptr || meta->tensor == nullptr || !meta->is_flat_kernel || leaf->view_src != nullptr) {
+        return std::nullopt;
+    }
+    return meta->tensor->cpu().reshape(shape);
+}
+
 static void ggml_backend_metalium_conv2d_direct(ggml_backend_metalium_context* ctx, struct ggml_tensor* dst) {
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     // src0 is the conv kernel, stored ROW_MAJOR on device (see set_tensor) to avoid
@@ -2632,7 +2718,8 @@ static void ggml_backend_metalium_conv2d_direct(ggml_backend_metalium_context* c
     const uint32_t OW = (uint32_t)dst->ne[0];
     const uint32_t OH = (uint32_t)dst->ne[1];
 
-    auto weight_tt = realize_ggml_view(src0);  // [OC, IC, KH, KW] TILE on device
+    std::optional<ttnn::Tensor> weight_on_host = ggml_metalium_flat_kernel_on_host(src0, ttnn::Shape({OC, IC, KH, KW}));
+    std::shared_ptr<ttnn::Tensor> weight_tt = weight_on_host ? nullptr : realize_ggml_view(src0);  // [OC, IC, KH, KW]
     auto input_tt  = realize_ggml_view(src1);  // [N, IC, IH, IW] TILE on device
     auto device = ctx->device->get_mesh_device();
 
@@ -2649,7 +2736,8 @@ static void ggml_backend_metalium_conv2d_direct(ggml_backend_metalium_context* c
         // scramble). The output reshape/permute below already assume NHWC.
         auto input_nhwc = ttnn::permute(*input_tt, ttsl::SmallVector<int64_t>{0, 2, 3, 1});
         auto input_2d = ttnn::reshape(input_nhwc, ttnn::Shape({N * IH * IW, IC}));
-        auto weight_2d = ttnn::reshape(*weight_tt, ttnn::Shape({OC, IC}));
+        auto weight_2d = weight_on_host ? weight_on_host->reshape(ttnn::Shape({OC, IC})).to_device(device.get())
+                                        : ttnn::reshape(*weight_tt, ttnn::Shape({OC, IC}));
         // Conv weights are stored ROW_MAJOR (see set_tensor); the matmul path needs TILE.
         // Reshape to 2D [OC,IC] first so tilize pads tile-aligned channel dims rather than
         // re-exploding the 1x1 kernel dims.
@@ -2700,7 +2788,8 @@ static void ggml_backend_metalium_conv2d_direct(ggml_backend_metalium_context* c
     // but other paths may still hand us a TILE weight, so handle both: untilize if tiled,
     // otherwise pull the row-major weight straight to host.
     ttnn::Tensor weight_host =
-        (weight_tt->layout() == tt::tt_metal::Layout::TILE)
+        weight_on_host ? *weight_on_host
+        : (weight_tt->layout() == tt::tt_metal::Layout::TILE)
             ? ttnn::untilize_with_unpadding(
                   *weight_tt,
                   ttnn::Shape({OC - 1, IC - 1, KH - 1, KW - 1}),
@@ -2920,6 +3009,103 @@ ggml_backend_metalium_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     delete ctx;
 }
 
+static const ggml_tensor * ggml_metalium_family(const ggml_tensor * tensor) {
+    // ggml collapses view_src to the storage root, so a root, its views and its in-place results share one family
+    return tensor->view_src != nullptr ? tensor->view_src : tensor;
+}
+
+// ggml-alloc gives a tensor's address range to a new tensor only once the old family is dead for the rest of the
+// graph, counting every sched split. A backend handed part of a graph cannot learn that from last-use counts, but
+// it sees the range change hands: a recorded range of another family that overlaps `tensor` is dead.
+//
+// Frees those, sparing also the families of tensor's sources when keep_src_families is set (before a node runs,
+// ggml-alloc may already have placed it over the in-place parent it reads). With record, `tensor` then holds the range.
+static void ggml_metalium_release_range(const ggml_tensor * tensor, bool keep_src_families, bool record) {
+    ggml_backend_buffer_t buffer = tensor->buffer;
+    // Only ggml-alloc's compute buffers reuse ranges. Weight uploads also run from several loader threads.
+    if (buffer == nullptr || buffer->iface.free_buffer != ggml_backend_metalium_buffer_free_buffer ||
+        ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+        tensor->data == nullptr || tensor->extra == nullptr || ggml_nbytes(tensor) == 0) {
+        return;
+    }
+    std::array<const ggml_tensor *, GGML_MAX_SRC + 1> keep;
+    size_t n_keep = 0;
+    keep[n_keep++] = ggml_metalium_family(tensor);
+    for (int i = 0; keep_src_families && i < GGML_MAX_SRC; i++) {
+        if (tensor->src[i] != nullptr) {
+            keep[n_keep++] = ggml_metalium_family(tensor->src[i]);
+        }
+    }
+
+    // Half-open: ggml-alloc can put a zero-size tensor at the address where its neighbour starts
+    const uintptr_t begin = (uintptr_t)tensor->data;
+    const uintptr_t end   = begin + ggml_nbytes(tensor);
+    auto * extra  = (ggml_tensor_extra_metalium *)tensor->extra;
+    auto * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
+
+    std::lock_guard<std::mutex> lock(bufctx->live_ranges_mutex);
+    auto & ranges = bufctx->live_ranges;
+    for (size_t i = 0; i < ranges.size();) {
+        const bool dead = ranges[i].begin < end && begin < ranges[i].end &&
+                          std::find(keep.begin(), keep.begin() + n_keep, ranges[i].family) == keep.begin() + n_keep;
+        if (dead) {
+            ranges[i].extra->tensor.reset();
+        }
+        if (dead || (record && ranges[i].extra == extra)) {
+            ranges[i] = ranges.back();
+            ranges.pop_back();
+        } else {
+            i++;
+        }
+    }
+    if (record) {
+        ranges.push_back({begin, end, ggml_metalium_family(tensor), extra});
+    }
+}
+
+static bool ggml_metalium_is_view_op(const ggml_tensor * t) {
+    return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+}
+
+static ggml_backend_metalium_buffer_context * ggml_metalium_compute_bufctx(const ggml_tensor * t) {
+    ggml_backend_buffer_t buffer = t->buffer;
+    if (buffer == nullptr || buffer->iface.free_buffer != ggml_backend_metalium_buffer_free_buffer ||
+        ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return nullptr;
+    }
+    return (ggml_backend_metalium_buffer_context *)buffer->context;
+}
+
+// A graph view shares the whole graph's use counts, so a partial graph can still tell when the last
+// consumer of a tensor ran, in whichever split. Consumers on another backend never report here;
+// their inputs are left to ggml_metalium_release_range.
+static void ggml_metalium_release_use(const ggml_tensor * tensor, const ggml_cgraph * cgraph) {
+    const ggml_hash_set & visited = cgraph->visited_hash_set;
+    for (int depth = 0; tensor != nullptr && depth < 64; depth++) {
+        auto * bufctx = ggml_metalium_compute_bufctx(tensor);
+        if (bufctx == nullptr || cgraph->use_counts == nullptr || visited.size == 0) {
+            return;
+        }
+        const size_t pos = ggml_hash_find(&visited, tensor);
+        if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(visited.used, pos) || visited.keys[pos] != tensor) {
+            return;
+        }
+        auto it = bufctx->remaining_uses.try_emplace(tensor, cgraph->use_counts[pos]).first;
+        if (it->second <= 0 || --it->second > 0 || (tensor->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT))) {
+            return;
+        }
+        // A view holds no device tensor; once it is dead, one use of what it reads is over
+        if (ggml_metalium_is_view_op(tensor)) {
+            tensor = tensor->src[0];
+            continue;
+        }
+        if (tensor->extra != nullptr) {
+            ((ggml_tensor_extra_metalium *)tensor->extra)->tensor.reset();
+        }
+        return;
+    }
+}
+
 static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *tensor,
                                                 const void *data, size_t offset,
@@ -2942,7 +3128,8 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     ggml_tensor_extra_metalium * meta = (ggml_tensor_extra_metalium *)tensor->extra;
 
     // Make sure we are not writing to a view tensor
-    if(size != ggml_nbytes(tensor) || (meta->tensor && ggml_tt_tensors_shape_equal(tensor, *meta->tensor) == false)
+    if(size != ggml_nbytes(tensor) ||
+        (meta->tensor && !meta->is_flat_kernel && ggml_tt_tensors_shape_equal(tensor, *meta->tensor) == false)
         || tensor->view_src != NULL) {
         // FIXME: Reenable this when got time
         // fprintf(stderr, "Warning: Metalium set_tensor() does not work with tensor views\n");
@@ -2969,6 +3156,12 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         intermidiate_type = tt::tt_metal::DataType::UINT32;
         tilize = false; // Integer tensors are indices - operations will want them untiled
     }
+    else if (ggtype == GGML_TYPE_F8_E4M3 || ggtype == GGML_TYPE_F8_E5M2) {
+        // FP8 is not ggml_is_quantized. Decode to BF16 so it follows the F16 path, including untiled 4D conv weights
+        std::vector<float> decoded(ggml_nelements(tensor));
+        ggml_get_type_traits(ggtype)->to_float(data, decoded.data(), decoded.size());
+        storage = host_data_to_tt_host_buffer<float, bfloat16>(decoded.data(), decoded.size());
+    }
     else if (ggml_is_quantized(ggtype)) {
         // Even though in theory transfering BFP16 to device uses much less bandwidth then FP32. GGML nativly have support
         // converting quantized types into FP32. Converting to BFP16 would be an extra step making everything slower
@@ -2992,9 +3185,12 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     //     4D with tiny inner dims, but their consumers (flux_rope, ...) require TILE layout.
     //   - types whose row-major device dtype is BFLOAT16 (matches intermidiate_type, so the
     //     to_device() dtype check below passes and contiguous weights need no permute).
+    bool flat_kernel = false;
     if(tilize && buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && ggml_n_dims(tensor) == 4 &&
-       (ggtype == GGML_TYPE_F32 || ggtype == GGML_TYPE_F16 || ggtype == GGML_TYPE_BF16)) {
+       (ggtype == GGML_TYPE_F32 || ggtype == GGML_TYPE_F16 || ggtype == GGML_TYPE_BF16 ||
+        ggtype == GGML_TYPE_F8_E4M3 || ggtype == GGML_TYPE_F8_E5M2)) {
         tilize = false;
+        flat_kernel = true;
     }
 
     // Convert GGML shape to TT shape
@@ -3038,6 +3234,22 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         permute = perm;
     }
 
+    // A ROW_MAJOR page is one innermost row, padded to the DRAM alignment (64 B on Blackhole), so a
+    // kernel kept as [.., KH, KW] spends a whole page per KW values: 10.7x its size for 3x3, 32x for
+    // 1x1. Store it as wide rows; realize_ggml_view() restores the ggml shape when it is read.
+    flat_kernel = flat_kernel && !permute.has_value();
+    if(flat_kernel) {
+        const size_t n = ggml_nelements(tensor);
+        uint32_t row = 1;
+        while(row < 4096 && n % (row * 2) == 0) {
+            row *= 2;
+        }
+        shape[0] = 1;
+        shape[1] = 1;
+        shape[2] = (uint32_t)(n / row);
+        shape[3] = row;
+    }
+
     ttnn::Tensor t(std::move(*storage), ttnn::Shape(shape)
         , intermidiate_type, tt::tt_metal::Layout::ROW_MAJOR);
 
@@ -3065,11 +3277,13 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
 
         GGML_ASSERT(t.storage_type() == ttnn::StorageType::DEVICE);
         GGML_ASSERT(t.dtype() == final_type);
-        GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, t));
+        GGML_ASSERT(flat_kernel || ggml_tt_tensors_shape_equal(tensor, t));
         GGML_ASSERT(t.layout() == (tilize ? tt::tt_metal::Layout::TILE : tt::tt_metal::Layout::ROW_MAJOR));
         *meta = ggml_tensor_extra_metalium {
             .tensor = std::make_shared<ttnn::Tensor>(std::move(t)),
+            .is_flat_kernel = flat_kernel,
         };
+        ggml_metalium_release_range(tensor, false, true);
 
         // Lightweight, env-gated upload probe (mirrors GGML_METALIUM_DUMP_MEM). Set
         // GGML_METALIUM_DUMP_UPLOAD=1 to trace device DRAM growth per ~32 uploaded
@@ -3240,11 +3454,20 @@ ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
     ttnn::Tensor ret = ttnn::identity(src_tensor);
     GGML_ASSERT(ret.storage_type() == ttnn::StorageType::DEVICE);
     dst_meta->tensor = std::make_shared<ttnn::Tensor>(std::move(ret));
+    dst_meta->is_pretransposed = src_meta->is_pretransposed;
+    dst_meta->is_flat_kernel = src_meta->is_flat_kernel;
+    ggml_metalium_release_range(dst, false, true);
     return true;
 }
 
 static void ggml_backend_metalium_buffer_reset(ggml_backend_buffer_t buffer) {
     ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
+    {
+        std::lock_guard<std::mutex> lock(bufctx->live_ranges_mutex);
+        bufctx->live_ranges.clear();
+    }
+    bufctx->remaining_uses.clear();
+    bufctx->produced.clear();
     bufctx->metadata_to_free.clear();
 }
 
@@ -3255,6 +3478,8 @@ static struct ggml_backend_buffer_i ggml_backend_metalium_buffer_interface = {
     /* .memset_tensor   = */ nullptr,
     /* .set_tensor      = */ ggml_backend_metalium_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_metalium_buffer_get_tensor,
+    /* .set_tensor_2d   = */ nullptr,
+    /* .get_tensor_2d   = */ nullptr,
     /* .cpy_tensor      = */ ggml_backend_metalium_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_metalium_buffer_clear,
     /* .reset           = */ ggml_backend_metalium_buffer_reset,
@@ -3349,8 +3574,8 @@ static ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(ggml_backend
 // metalium_bin_op and _scale), so no two nodes share a device buffer and each
 // holder's lifetime is exactly [produced .. last_use]. The lone exception is
 // GGML_OP_SET (KV-cache, ggml_backend_metalium_set) which really does alias dst
-// to the cache base, but that base has op==GGML_OP_NONE and is excluded from the
-// free loop by the `root->op != GGML_OP_NONE` guard, so it is never freed here.
+// to the cache base, but that base has op==GGML_OP_NONE and lives outside the compute
+// buffer, which the free loop's op-NONE guard excludes, so it is never freed here.
 static struct ggml_tensor * find_mem_holder(struct ggml_tensor * t) {
     for (;;) {
         if (t->op == GGML_OP_VIEW && t->view_src) {
@@ -3364,16 +3589,45 @@ static struct ggml_tensor * find_mem_holder(struct ggml_tensor * t) {
     }
 }
 
+// An in-place result is a fresh device tensor here, while ggml says the parents' bytes are now the result's.
+// Point the parents at it so their stale tensors are freed now rather than when ggml-alloc reuses the range.
+static void ggml_metalium_alias_inplace_parents(struct ggml_tensor * node) {
+    if (node->view_src == nullptr || node->buffer == nullptr) {
+        return;
+    }
+    const auto & result = ((ggml_tensor_extra_metalium *)node->extra)->tensor;
+    struct ggml_tensor * parent = node->src[0];
+    while (parent != nullptr) {
+        parent = find_mem_holder(parent);
+        auto * meta = (ggml_tensor_extra_metalium *)parent->extra;
+        // A parent this node overwrites only part of keeps its tensor; so do weights (LoRA merges in place)
+        if (parent == node || meta == nullptr || parent->buffer != node->buffer ||
+            ggml_backend_buffer_get_usage(parent->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+            ggml_metalium_family(parent) != ggml_metalium_family(node) ||
+            parent->data != node->data || !ggml_are_same_layout(parent, node)) {
+            return;
+        }
+        meta->tensor = result;
+        ggml_metalium_release_range(parent, false, true);
+        parent = parent->view_src != nullptr ? parent->src[0] : nullptr;
+    }
+}
+
 static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
 
     constexpr int magic_exp = 6;
     constexpr int magic = (1<<6)-1;
 
+    // A size-0 cgraph is a ggml_graph_view: a ggml_backend_sched split, or a slice run for an eval callback.
+    // Nodes after it may still read a tensor whose last use here is not its last use, and nothing marks such
+    // tensors, so a partial graph frees device memory only as ggml-alloc reuses address ranges.
+    const bool whole_graph = cgraph->size != 0;
+
     // Build last-use map: for each tensor, the index of the last node that uses it as a source.
     // We track the memory holder so we free the actual device memory holder.
     std::unordered_map<struct ggml_tensor*, int> last_use;
-    for (int i = 0; i < cgraph->n_nodes; i++) {
+    for (int i = 0; whole_graph && i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         for (int s = 0; s < GGML_MAX_SRC; s++) {
             if (node->src[s]) {
@@ -3382,7 +3636,7 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
         }
     }
     // Also mark the final graph output so we never free it
-    if (cgraph->n_nodes > 0) {
+    if (whole_graph && cgraph->n_nodes > 0) {
         struct ggml_tensor * final_node = cgraph->nodes[cgraph->n_nodes - 1];
         last_use[find_mem_holder(final_node)] = cgraph->n_nodes; // beyond last index
     }
@@ -3398,6 +3652,24 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
         // Bypass post conition checks for these ops because they are evaluated lazily
         if(node->op == GGML_OP_VIEW || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE) {
             continue;
+        }
+
+        // Handlers may write the result into a source's extra too (CPY, SET, SET_ROWS); spot those by the change
+        std::array<const ttnn::Tensor *, GGML_MAX_SRC> src_tensors{};
+        if (!whole_graph) {
+            auto * bufctx = ggml_metalium_compute_bufctx(node);
+            if (bufctx != nullptr && !bufctx->produced.insert(node).second) {
+                // ggml_backend_sched may compute an allocated graph again; its use counts start over
+                bufctx->remaining_uses.clear();
+                bufctx->produced.clear();
+                bufctx->produced.insert(node);
+            }
+            ggml_metalium_release_range(node, true, false);
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                if (node->src[s] && node->src[s]->extra) {
+                    src_tensors[s] = ((ggml_tensor_extra_metalium *)node->src[s]->extra)->tensor.get();
+                }
+            }
         }
 
         // std::cout << ggml_op_name(node->op) << " node " << node->name << " with address " << node->data << std::endl;
@@ -3594,18 +3866,48 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
             abort();
         }
 
+        if (!whole_graph) {
+            // Decide before releasing: releasing the node frees its in-place-reused parent, which is a source too
+            std::array<bool, GGML_MAX_SRC> side_written{};
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                const ggml_tensor * src = node->src[s];
+                if (src && src->extra && ggml_metalium_family(src) == ggml_metalium_family(node)) {
+                    const auto & t = ((ggml_tensor_extra_metalium *)src->extra)->tensor;
+                    side_written[s] = t != nullptr && t.get() != src_tensors[s];
+                }
+            }
+            ggml_metalium_release_range(node, false, true);
+            ggml_metalium_alias_inplace_parents(node);
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                if (side_written[s]) {
+                    ggml_metalium_release_range(node->src[s], false, true);
+                }
+            }
+            // An eval callback reads the sources of the slice's last node once this returns
+            // (imatrix reads src[1]); leave those to ggml_metalium_release_range.
+            for (int s = 0; i + 1 < cgraph->n_nodes && s < GGML_MAX_SRC; s++) {
+                if (node->src[s]) {
+                    ggml_metalium_release_use(node->src[s], cgraph);
+                }
+            }
+        }
+
         // Release device memory for source tensors whose last consumer just executed.
-        // Only free compute intermediates (tensors that have an op), not weight/param tensors.
+        // Only free compute intermediates: tensors that have an op, or scratch leaves in a compute
+        // buffer (e.g. a CPY destination) -- not weights, graph inputs or outputs.
         for (int s = 0; s < GGML_MAX_SRC; s++) {
             struct ggml_tensor * src = node->src[s];
             if (!src) continue;
             struct ggml_tensor * root = find_mem_holder(src);
             auto it = last_use.find(root);
-            if (it != last_use.end() && it->second == i && root->op != GGML_OP_NONE) {
+            const bool scratch_leaf = root->op == GGML_OP_NONE && ggml_metalium_compute_bufctx(root) != nullptr &&
+                                      !(root->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT));
+            if (it != last_use.end() && it->second == i && (root->op != GGML_OP_NONE || scratch_leaf)) {
                 auto * root_meta = (ggml_tensor_extra_metalium*)root->extra;
                 if (root_meta && root_meta->tensor) {
                     long refcount = root_meta->tensor.use_count();
-                    if (refcount > 1) {
+                    // CPY hands its result to its destination too; that is not a leak
+                    if (refcount > 1 && root_meta->tensor != meta->tensor) {
                         fmt::println(stderr, "[LEAK] op={} name={} src[{}] root_op={} root_name={} refcount={}",
                             ggml_op_name(node->op), node->name, s,
                             ggml_op_name(root->op), root->name, refcount);
@@ -3854,6 +4156,8 @@ static struct ggml_backend_i metalium_backend_i = {
     /* .free                    = */ ggml_backend_metalium_free,
     /* .set_tensor_async        = */ NULL,
     /* .get_tensor_async        = */ NULL,
+    /* .set_tensor_2d_async     = */ NULL,
+    /* .get_tensor_2d_async     = */ NULL,
     /* .cpy_tensor_async        = */ NULL,
     /* .synchronize             = */ ggml_backend_metalium_synchronize,
     /* .graph_plan_create       = */ NULL,
