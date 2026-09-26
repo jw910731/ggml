@@ -1,4 +1,5 @@
 #include "build_RelWithDebInfo/include/tt-metalium/host_api.hpp"
+#include "build_RelWithDebInfo/include/ttnn/config.hpp"
 #include "fmt/base.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
@@ -63,9 +64,11 @@
 #include <ttnn/operations/data_movement/transpose/transpose.hpp>
 #include <ttnn/operations/data_movement/permute/permute.hpp>
 #include <ttnn/operations/data_movement/repeat/repeat.hpp>
+#include <ttnn/operations/data_movement/repeat_interleave/repeat_interleave.hpp>
 #include <ttnn/operations/data_movement/concat/concat.hpp>
 #include <ttnn/operations/copy/typecast/typecast.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
+#include <ttnn/operations/pool/upsample/upsample.hpp>
 // #include <tt-metalium/persistent_kernel_cache.hpp>
 #include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
 #include <ttnn/operations/reduction/generic/generic_reductions.hpp>
@@ -255,6 +258,7 @@ struct ggml_backend_metalium_debug_flags {
     bool cache_mm_transpose = true;        // Cache the transpose kernel for matmul
     bool disable_program_cache = false;     // Disables the program cache
     bool experimental_ops = true;          // Enable experimental ops that is known to cause trouble
+    bool memory_profile = false;
 };
 
 static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
@@ -1694,7 +1698,7 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
     memcpy(&params, dst->op_params, sizeof(params));
     auto [scale, max_bias] = params;
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
-    
+
     const ggml_tensor *src0 = dst->src[0];
     const ggml_tensor *src1 = dst->src[1];
 
@@ -2540,14 +2544,6 @@ static bool ggml_backend_metalium_can_pad(const struct ggml_tensor * dst) {
     if (circular) {
         return false;
     }
-    // ttnn::pad does not support front (left) padding
-    const int32_t lp0 = ((const int32_t *)(dst->op_params))[0];
-    const int32_t lp1 = ((const int32_t *)(dst->op_params))[2];
-    const int32_t lp2 = ((const int32_t *)(dst->op_params))[4];
-    const int32_t lp3 = ((const int32_t *)(dst->op_params))[6];
-    if (lp0 != 0 || lp1 != 0 || lp2 != 0 || lp3 != 0) {
-        return false;
-    }
     return true;
 }
 
@@ -2591,7 +2587,14 @@ static void ggml_backend_metalium_pad(ggml_backend_metalium_context * ctx, struc
     }
     padding.push_back({(uint32_t)lp0, (uint32_t)rp0});
 
-    auto result = ttnn::pad(*src_tensor, padding, 0.0f);
+    // ttnn::pad places the input at an offset only in ROW_MAJOR; TILE supports end padding alone.
+    ttnn::Tensor result;
+    if ((lp0 != 0 || lp1 != 0 || lp2 != 0 || lp3 != 0) && src_tensor->layout() == tt::tt_metal::Layout::TILE) {
+        auto rm = ttnn::to_layout(*src_tensor, tt::tt_metal::Layout::ROW_MAJOR);
+        result = ttnn::tilize_with_zero_padding(ttnn::pad(rm, padding, 0.0f));
+    } else {
+        result = ttnn::pad(*src_tensor, padding, 0.0f);
+    }
 
     *dst_meta = {
         .tensor = std::make_shared<ttnn::Tensor>(result),
@@ -2608,6 +2611,47 @@ static void ggml_backend_metalium_upscale(ggml_backend_metalium_context * ctx, s
 
     auto src_tt = realize_ggml_view(src0);
     auto* device = src_tt->device();
+
+    bool integer_scale = true;
+    std::array<uint32_t, GGML_MAX_DIMS> sf;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        integer_scale &= dst->ne[i] % src0->ne[i] == 0;
+        sf[i] = (uint32_t)(dst->ne[i] / src0->ne[i]);
+    }
+
+    if (integer_scale) {
+        // ttnn::upsample scales dims 1 and 2 of a 4D tensor and copies dim 3 as whole sticks, so C and H
+        // scale in place while W, the innermost dim, is scaled with the last two dims transposed. It takes
+        // TILE input only without tile padding, and always returns ROW_MAJOR.
+        auto upsample_dims_1_2 = [](ttnn::Tensor t, uint32_t s1, uint32_t s2) {
+            if (t.layout() == tt::tt_metal::Layout::TILE && t.padded_shape() != t.logical_shape()) {
+                t = ttnn::to_layout(t, tt::tt_metal::Layout::ROW_MAJOR);
+            }
+            return ttnn::tilize_with_zero_padding(ttnn::upsample(t, std::array<int, 2>{(int)s1, (int)s2}));
+        };
+
+        ttnn::Tensor res = *src_tt;
+        uint32_t sf_c = sf[2];
+        if (sf[0] > 1) {
+            res = ttnn::transpose(upsample_dims_1_2(ttnn::transpose(res, -2, -1), sf_c, sf[0]), -2, -1);
+            sf_c = 1;
+        }
+        if (sf[1] > 1 || sf_c > 1) {
+            res = upsample_dims_1_2(res, sf_c, sf[1]);
+        }
+        if (sf[3] > 1) {
+            res = ttnn::repeat_interleave(res, sf[3], 0);
+        }
+
+        tt::tt_metal::DataType final_type = ggml2tt_type(dst->type, device->arch());
+        if (res.dtype() != final_type) {
+            res = ttnn::typecast(res, final_type);
+        }
+        *dst_meta = {
+            .tensor = std::make_shared<ttnn::Tensor>(std::move(res)),
+        };
+        return;
+    }
 
     // Read source data to host as float
     const size_t src_nelems = ggml_nelements(src0);
@@ -3340,7 +3384,7 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
         // Since ggml tensor uses stride to express transpose and this is "get buffer" which produce the final data to host memory
         // Instead of setting do_transpose as true intuitively, we set it to false.
         // That way we don't suffer from double transpose = no op
-        bool do_transpose = false; 
+        bool do_transpose = false;
         while(src->op == GGML_OP_TRANSPOSE) {
             do_transpose = !do_transpose;
             src = src->src[0];
@@ -4116,10 +4160,10 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
             return tensor_supported(src1);
         case GGML_OP_UPSCALE:
         {
-            // Only support nearest mode for now
+            // Only support nearest mode for now. Align-corners changes which source pixel nearest mode
+            // picks, and neither the device nor the host path implements it.
             const int32_t mode_flags = ((const int32_t *)(op->op_params))[0];
-            const int mode = mode_flags & 0xFF;
-            return mode == GGML_SCALE_MODE_NEAREST;
+            return mode_flags == GGML_SCALE_MODE_NEAREST;
         }
         case GGML_OP_TIMESTEP_EMBEDDING:
             return ggml_backend_metalium_can_timestep_embedding(op);

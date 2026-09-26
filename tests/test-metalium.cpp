@@ -1048,6 +1048,10 @@ static void add_unittests(std::vector<std::unique_ptr<test_case>>& tests)
         ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
         return ggml_pad_ext(ctx, a, 16, 15, 8, 7, 0, 0, 0, 0);
     }, "Pad ext 2D small tensor large padding"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, 64, 1, 96);
+        return ggml_pad_ext(ctx, a, 1, 1, 1, 1, 0, 0, 0, 0);
+    }, "Pad ext 1px spatial 64x64 T=1 C=96 (VAE conv input)"));
 
     tests.push_back(make_test([](ggml_context* ctx) {
         // A smaller and stripped down version of the MLP Mixer model
@@ -1193,6 +1197,22 @@ static void add_upscale_tests(std::vector<std::unique_ptr<test_case>>& tests)
 
     // Small dimensions
     make_upscale_test(8, 8, 3, 1, 2, "Upscale 2x 8x8 C=3 N=1 (small)");
+
+    auto make_interpolate_test = [&](std::array<int64_t, 4> ne, std::array<int64_t, 4> ne_out, const char* name) {
+        tests.push_back(make_test([=](ggml_context* ctx) {
+            ggml_tensor* input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+            return ggml_interpolate(ctx, input, ne_out[0], ne_out[1], ne_out[2], ne_out[3], GGML_SCALE_MODE_NEAREST);
+        }, name, 1e-3));
+    };
+
+    // Per-dim factors, including the C and N dims ggml_upscale never scales (ggml_ext_kronecker does)
+    make_interpolate_test({32, 32, 32, 1}, {64, 32, 32, 1}, "Interpolate nearest W 2x only");
+    make_interpolate_test({32, 32, 32, 1}, {32, 96, 32, 1}, "Interpolate nearest H 3x only");
+    make_interpolate_test({13, 17, 5, 1}, {39, 34, 5, 1}, "Interpolate nearest W 3x H 2x 13x17 C=5 (non tile-aligned)");
+    make_interpolate_test({16, 16, 4, 2}, {32, 32, 8, 4}, "Interpolate nearest 2x on every dim");
+
+    // Non-integer ratios take the host path
+    make_interpolate_test({13, 17, 8, 1}, {20, 30, 8, 1}, "Interpolate nearest non-integer ratio");
 }
 
 static void add_conv2d_direct_tests(std::vector<std::unique_ptr<test_case>>& tests)
