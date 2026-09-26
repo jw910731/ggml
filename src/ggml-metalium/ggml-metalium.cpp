@@ -87,6 +87,7 @@
 #include "tmp_mul_mat.hpp"
 #include "tmp_soft_max.hpp"
 #include "flux_rope.hpp"
+#include "graph_report.hpp"
 
 extern void metalium_register_all_kernel();
 
@@ -279,7 +280,8 @@ static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
         .print_view = parse_env("GGML_METALIUM_PRINT_VIEW"),
         .cache_mm_transpose = parse_env("GGML_METALIUM_CACHE_MM_TRANSPOSE"), // GGML uses pre-transposed weights. Remove this flag when TT implements it
         .disable_program_cache = parse_env("GGML_METALIUM_DISABLE_PROGRAM_CACHE"),
-        .experimental_ops = parse_env("GGML_METALIUM_EXPERIMENTAL_OPS")
+        .experimental_ops = parse_env("GGML_METALIUM_EXPERIMENTAL_OPS"),
+        .memory_profile = parse_env("GGML_METALIUM_MEMORY_PROFILE")
     };
 }();
 
@@ -3050,6 +3052,8 @@ static size_t ggml_backend_metalium_buffer_type_get_alloc_size(ggml_backend_buff
 static void
 ggml_backend_metalium_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_metalium_buffer_context * ctx = ( ggml_backend_metalium_buffer_context *)buffer->context;
+    // Keeps the frees in the graph report
+    ggml_metalium_report report(*ctx->device);
     delete ctx;
 }
 
@@ -3150,7 +3154,45 @@ static void ggml_metalium_release_use(const ggml_tensor * tensor, const ggml_cgr
     }
 }
 
-static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer,
+// The device tensor realize() reads for t. Unlike find_mem_holder, a VIEW goes through src[0]: its view_src skips
+// past in-place results to their stale base.
+static const ttnn::Tensor * ggml_metalium_report_source(const struct ggml_tensor * t) {
+    for (;;) {
+        if ((t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
+             t->op == GGML_OP_TRANSPOSE) && t->src[0] != nullptr) {
+            t = t->src[0];
+            continue;
+        }
+        const auto * meta = (const ggml_tensor_extra_metalium *)t->extra;
+        if (meta != nullptr && meta->tensor != nullptr) {
+            return meta->tensor.get();
+        }
+        if (t->view_src == nullptr) {
+            return nullptr;
+        }
+        t = t->view_src;
+    }
+}
+
+// Runs one call into a buffer as a reported operation, ggml::<op>(<tensor name>). call() returns whether it wrote output.
+template <typename F>
+static void ggml_metalium_reported_call(ttnn::MeshDevice & device, const char * op, const ggml_tensor * tensor,
+                                        const ggml_tensor * input, const ggml_tensor * output, F && call) {
+    ggml_metalium_report report(device);
+    if (!report.active()) {
+        call();
+        return;
+    }
+    std::vector<std::reference_wrapper<const ttnn::Tensor>> inputs;
+    if (const ttnn::Tensor * t = input != nullptr ? ggml_metalium_report_source(input) : nullptr) {
+        inputs.emplace_back(*t);
+    }
+    report.op_begin(fmt::format("ggml::{}({})", op, tensor->name), tensor->name, inputs);
+    const bool produced = call();
+    report.op_end(produced && output != nullptr ? ggml_metalium_report_source(output) : nullptr);
+}
+
+static bool ggml_backend_metalium_buffer_set_tensor_impl(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *tensor,
                                                 const void *data, size_t offset,
                                                 size_t size)
@@ -3177,7 +3219,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         || tensor->view_src != NULL) {
         // FIXME: Reenable this when got time
         // fprintf(stderr, "Warning: Metalium set_tensor() does not work with tensor views\n");
-        return;
+        return false;
     }
 
     std::optional<tt::tt_metal::HostBuffer> storage;
@@ -3348,9 +3390,10 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
             }
         }
     }
+    return true;
 }
 
-static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer,
+static void ggml_backend_metalium_buffer_get_tensor_impl(ggml_backend_buffer_t buffer,
                                                 const ggml_tensor *tensor,
                                                 void *data, size_t offset,
                                                 size_t size)
@@ -3461,11 +3504,14 @@ ggml_backend_metalium_buffer_init_tensor(ggml_backend_buffer_t buffer,
     //       as the "real" shape information (GGML allocates KV cache as a very long 1D tensor) is missing here
     std::string_view name(tensor->name);
     if(std::string_view(name).find("cache") != std::string::npos && tensor->op == GGML_OP_NONE) {
-        std::vector<uint32_t> shape(tensor->ne, tensor->ne + GGML_MAX_DIMS);
-        std::reverse(shape.begin(), shape.end());
-        auto t = ttnn::zeros(ttnn::Shape(shape), ggml2tt_type(tensor->type, bufctx->device->arch()), tt::tt_metal::Layout::ROW_MAJOR);
-        t = ttnn::tilize_with_zero_padding(t.to_device(bufctx->device.get()));
-        meta->tensor = std::make_shared<ttnn::Tensor>(std::move(t));
+        ggml_metalium_reported_call(*bufctx->device, "init_tensor", tensor, nullptr, tensor, [&] {
+            std::vector<uint32_t> shape(tensor->ne, tensor->ne + GGML_MAX_DIMS);
+            std::reverse(shape.begin(), shape.end());
+            auto t = ttnn::zeros(ttnn::Shape(shape), ggml2tt_type(tensor->type, bufctx->device->arch()), tt::tt_metal::Layout::ROW_MAJOR);
+            t = ttnn::tilize_with_zero_padding(t.to_device(bufctx->device.get()));
+            meta->tensor = std::make_shared<ttnn::Tensor>(std::move(t));
+            return true;
+        });
     }
     // std::cout << "Creating tensor with address: " << tensor->data << ", shape = " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << ", name " << tensor->name << std::endl;
     GGML_UNUSED(buffer);
@@ -3481,7 +3527,7 @@ static void ggml_backend_metalium_buffer_clear(ggml_backend_buffer_t buffer,
 }
 
 static bool
-ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
+ggml_backend_metalium_buffer_cpy_tensor_impl(ggml_backend_buffer_t buffer,
                                     const ggml_tensor *src,
                                     ggml_tensor *dst)
 {
@@ -3506,6 +3552,8 @@ ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
 
 static void ggml_backend_metalium_buffer_reset(ggml_backend_buffer_t buffer) {
     ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
+    // Keeps the frees in the graph report
+    ggml_metalium_report report(*bufctx->device);
     {
         std::lock_guard<std::mutex> lock(bufctx->live_ranges_mutex);
         bufctx->live_ranges.clear();
@@ -3513,6 +3561,34 @@ static void ggml_backend_metalium_buffer_reset(ggml_backend_buffer_t buffer) {
     bufctx->remaining_uses.clear();
     bufctx->produced.clear();
     bufctx->metadata_to_free.clear();
+}
+
+static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
+                                                   const void * data, size_t offset, size_t size) {
+    auto & device = *((ggml_backend_metalium_buffer_context *)buffer->context)->device;
+    ggml_metalium_reported_call(device, "set_tensor", tensor, nullptr, tensor, [&] {
+        return ggml_backend_metalium_buffer_set_tensor_impl(buffer, tensor, data, offset, size);
+    });
+}
+
+static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor,
+                                                   void * data, size_t offset, size_t size) {
+    auto & device = *((ggml_backend_metalium_buffer_context *)buffer->context)->device;
+    ggml_metalium_reported_call(device, "get_tensor", tensor, tensor, nullptr, [&] {
+        ggml_backend_metalium_buffer_get_tensor_impl(buffer, tensor, data, offset, size);
+        return true;
+    });
+}
+
+static bool ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src,
+                                                    ggml_tensor * dst) {
+    auto & device = *((ggml_backend_metalium_buffer_context *)buffer->context)->device;
+    bool copied = false;
+    ggml_metalium_reported_call(device, "cpy_tensor", dst, src, dst, [&] {
+        copied = ggml_backend_metalium_buffer_cpy_tensor_impl(buffer, src, dst);
+        return copied;
+    });
+    return copied;
 }
 
 static struct ggml_backend_buffer_i ggml_backend_metalium_buffer_interface = {
@@ -3657,8 +3733,28 @@ static void ggml_metalium_alias_inplace_parents(struct ggml_tensor * node) {
     }
 }
 
+// The device tensors a node reads. Views have no device tensor of their own, so report the one realize() reads.
+static std::vector<std::reference_wrapper<const ttnn::Tensor>> ggml_metalium_report_inputs(struct ggml_tensor * node) {
+    std::vector<std::reference_wrapper<const ttnn::Tensor>> inputs;
+    for (int s = 0; s < GGML_MAX_SRC; s++) {
+        if (node->src[s] == nullptr) {
+            continue;
+        }
+        const ttnn::Tensor * tensor = ggml_metalium_report_source(node->src[s]);
+        if (tensor == nullptr) {
+            continue;
+        }
+        if (std::ranges::none_of(inputs, [tensor](const ttnn::Tensor & t) { return &t == tensor; })) {
+            inputs.emplace_back(*tensor);
+        }
+    }
+    return inputs;
+}
+
 static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
+    ggml_metalium_report report(*((ggml_backend_metalium_device_context *) backend->device->context)->device);
+    report.flush_on_exit();
 
     constexpr int magic_exp = 6;
     constexpr int magic = (1<<6)-1;
@@ -3714,6 +3810,13 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
                     src_tensors[s] = ((ggml_tensor_extra_metalium *)node->src[s]->extra)->tensor.get();
                 }
             }
+        }
+
+        // Opened after the range release: graph_report.py takes frees inside a node for its inputs when it has none
+        const bool report_node = report.active() && node->op != GGML_OP_NONE;
+        if (report_node) {
+            auto inputs = ggml_metalium_report_inputs(node);
+            report.op_begin(fmt::format("ggml::{}", ggml_op_desc(node)), node->name, inputs);
         }
 
         // std::cout << ggml_op_name(node->op) << " node " << node->name << " with address " << node->data << std::endl;
@@ -3908,6 +4011,9 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
             fmt::println(stderr, "Mismatched tensor shapes for node '{}' ({}): GGML wants [{}, {}, {}, {}], TTNN generates {}\n"
                 , node->name, ggml_op_name(node->op), node->ne[0], node->ne[1], node->ne[2], node->ne[3], meta->tensor->logical_shape());
             abort();
+        }
+        if (report_node) {
+            report.op_end(meta->tensor.get());
         }
 
         if (!whole_graph) {
@@ -4379,6 +4485,9 @@ static const ggml_backend_device_i ggml_backend_metalium_device_interface = {
 
 struct ggml_metalium_device_teardown {
     std::vector<std::unique_ptr<ggml_backend_metalium_device_context>> contexts;
+
+    // Writes the graph capture in progress while GraphTracker's thread-locals are still alive
+    ~ggml_metalium_device_teardown() { ggml_metalium_report_flush(); }
 };
 
 static bool ggml_metalium_on_main_thread()
@@ -4433,6 +4542,7 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
         if(g_debug_flags.disable_program_cache) {
             fmt::println("Persistent kernel cache is disabled. Things will be slower");
         }
+        ggml_metalium_report_init(g_debug_flags.memory_profile);
         // TODO: Support multiple devices (TT supports mesh configuration so it's going to be tricky)
         // but for now we just work on 1 device at a time
         static std::unique_ptr<ggml_backend_metalium_reg_context> ctx = std::make_unique<ggml_backend_metalium_reg_context>();

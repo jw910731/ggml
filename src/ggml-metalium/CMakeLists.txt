@@ -11,6 +11,7 @@ ggml_add_backend_library(ggml-metalium
     tmp_mul_mat.cpp
     tmp_soft_max.cpp
     flux_rope.cpp
+    graph_report.cpp
 )
 
 target_include_directories(ggml-metalium PRIVATE
@@ -133,6 +134,25 @@ target_compile_definitions(
     FMT_HEADER_ONLY
     SPDLOG_FMT_EXTERNAL
 )
+
+# ttnn's op-profiler hooks live in its headers and only emit for translation units that define TRACY_ENABLE, so
+# without tt-metal's Tracy definitions the device operations instantiated here (tmp_*, flux_rope, ttprm) are missing
+# from the ops perf report. tt-metal hard-codes TRACY_TIMER_FALLBACK whenever it builds with Tracy.
+set(GGML_METALIUM_TT_METAL_CACHE "$ENV{TT_METAL_HOME}/build/CMakeCache.txt")
+set(GGML_METALIUM_TT_METAL_TRACY OFF)
+if(EXISTS "${GGML_METALIUM_TT_METAL_CACHE}")
+    # Reconfigure when tt-metal is, e.g. build_metal.sh --disable-profiler or a build type switch re-pointing build/
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GGML_METALIUM_TT_METAL_CACHE}")
+    file(STRINGS "${GGML_METALIUM_TT_METAL_CACHE}" GGML_METALIUM_TT_METAL_TRACY_ENTRY REGEX "^ENABLE_TRACY:[A-Z]*=")
+    if(GGML_METALIUM_TT_METAL_TRACY_ENTRY)
+        string(REGEX REPLACE "^ENABLE_TRACY:[A-Z]*=" "" GGML_METALIUM_TT_METAL_TRACY "${GGML_METALIUM_TT_METAL_TRACY_ENTRY}")
+    endif()
+endif()
+if(GGML_METALIUM_TT_METAL_TRACY)
+    message(STATUS "Metalium: tt-metal was built with Tracy; enabling op profiling for backend device operations")
+    target_compile_definitions(ggml-metalium PRIVATE TRACY_ENABLE TRACY_IMPORTS TRACY_TIMER_FALLBACK)
+    target_link_libraries(ggml-metalium PRIVATE $ENV{TT_METAL_HOME}/build/lib/libtracy.so)
+endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsized-deallocation")
