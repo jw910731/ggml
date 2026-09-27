@@ -1,3 +1,4 @@
+#include "build_RelWithDebInfo/include/tt-metalium/base_types.hpp"
 #include "build_RelWithDebInfo/include/tt-metalium/host_api.hpp"
 #include "build_RelWithDebInfo/include/ttnn/config.hpp"
 #include "fmt/base.h"
@@ -236,8 +237,15 @@ static ttnn::DeviceComputeKernelConfig make_compute_kernel_config(ttnn::IDevice*
             const char* v = std::getenv("GGML_METALIUM_FP32_ACC");
             return v != nullptr && std::string(v) != "0";
         }();
+        static const tt::tt_metal::MathFidelity low_fidelity_level = []() {
+            const char* v = std::getenv("GGML_METALIUM_LOW_FIDELITY");
+            if(v != nullptr && std::string(v) != "0") {
+                return tt::tt_metal::MathFidelity::HiFi2;
+            }
+            return tt::tt_metal::MathFidelity::HiFi4;
+        }();
         cfg = ttnn::WormholeComputeKernelConfig{
-            .math_fidelity = MathFidelity::HiFi4,
+            .math_fidelity = low_fidelity_level,
             .math_approx_mode = false,
             .fp32_dest_acc_en = force_fp32_acc,
             .packer_l1_acc = force_fp32_acc
