@@ -145,11 +145,12 @@ struct ggml_tensor_extra_metalium
     bool is_pretransposed = false;
     // A 4D kernel kept ROW_MAJOR as [1, 1, rows, row] instead of its ggml shape (see set_tensor)
     bool is_flat_kernel = false;
+    // 0 for the ggml shape, else g: the TT shape is ggml_metalium_fold_shape(t, g) (see set_tensor)
+    uint8_t fold = 0;
 };
 
-static bool ggml_tt_tensors_shape_equal(const ggml_tensor* ggtensor, const ttnn::Tensor& ttensor)
+static bool ggml_tt_shape_equal(const ggml_tensor* ggtensor, const ttnn::Shape& shape)
 {
-    const ttnn::Shape& shape = ttensor.logical_shape();
     for(size_t i = 0; i < std::min<size_t>(GGML_MAX_DIMS, shape.size()); i++) {
         if(ggtensor->ne[GGML_MAX_DIMS - i - 1] != shape[i]) {
             return false;
@@ -173,6 +174,11 @@ static bool ggml_tt_tensors_shape_equal(const ggml_tensor* ggtensor, const ttnn:
     return true;
 }
 
+static bool ggml_tt_tensors_shape_equal(const ggml_tensor* ggtensor, const ttnn::Tensor& ttensor)
+{
+    return ggml_tt_shape_equal(ggtensor, ttensor.logical_shape());
+}
+
 #ifdef GGML_METALIUM_TTPRM
 // Hands the ttprm bridge the tensor already materialized for `node` without
 // exposing ggml_tensor_extra_metalium, which is private to this file. Nodes that
@@ -186,7 +192,7 @@ const ttnn::Tensor* ggml_metalium_materialized_tensor(const ggml_tensor* node)
     }
     // A pre-transposed weight holds the transpose of what GGML describes, so its
     // flat element order does not match the strides the bridge folds.
-    if(meta->is_pretransposed || !ggml_tt_tensors_shape_equal(node, *meta->tensor)) {
+    if(meta->is_pretransposed || meta->fold != 0 || !ggml_tt_tensors_shape_equal(node, *meta->tensor)) {
         return nullptr;
     }
     return meta->tensor.get();
@@ -270,6 +276,8 @@ struct ggml_backend_metalium_debug_flags {
     bool disable_program_cache = false;     // Disables the program cache
     bool experimental_ops = true;          // Enable experimental ops that is known to cause trouble
     bool memory_profile = false;
+    int fold = 0;                           // GGML_METALIUM_FOLD: 0 off, 1 auto, 2 fold any tensor it shrinks
+    bool fold_stats = false;                // Print the fold histogram at exit
 };
 
 static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
@@ -291,9 +299,127 @@ static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
         .cache_mm_transpose = parse_env("GGML_METALIUM_CACHE_MM_TRANSPOSE"), // GGML uses pre-transposed weights. Remove this flag when TT implements it
         .disable_program_cache = parse_env("GGML_METALIUM_DISABLE_PROGRAM_CACHE"),
         .experimental_ops = parse_env("GGML_METALIUM_EXPERIMENTAL_OPS"),
-        .memory_profile = parse_env("GGML_METALIUM_MEMORY_PROFILE")
+        .memory_profile = parse_env("GGML_METALIUM_MEMORY_PROFILE"),
+        .fold = []() {
+            const char* val = std::getenv("GGML_METALIUM_FOLD");
+            return val != nullptr ? std::clamp(atoi(val), 0, 2) : 0;
+        }(),
+        .fold_stats = parse_env("GGML_METALIUM_FOLD_STATS")
     };
 }();
+
+// Tile layout pads the last two dims to 32, so a tensor with tiny low dims mostly stores padding.
+// Folding g dims into the lane dim keeps the same row-major element order in far fewer tiles:
+//   g = 2: [ne3, ne2, ne1, ne0] -> [1, ne3, ne2, ne1*ne0]
+//   g = 3: [ne3, ne2, ne1, ne0] -> [1, 1, ne3, ne2*ne1*ne0]
+static std::array<uint32_t, GGML_MAX_DIMS> ggml_metalium_fold_shape(const ggml_tensor * t, int g) {
+    GGML_ASSERT(g == 2 || g == 3);
+    if (g == 2) {
+        return {1, (uint32_t)t->ne[3], (uint32_t)t->ne[2], (uint32_t)(t->ne[1] * t->ne[0])};
+    }
+    return {1, 1, (uint32_t)t->ne[3], (uint32_t)(t->ne[2] * t->ne[1] * t->ne[0])};
+}
+
+// Folds are only made with rows of at most 8192 lanes
+static bool ggml_metalium_fold_fits(const ggml_tensor * t, int g) {
+    return t->ne[0] * t->ne[1] * (g == 3 ? t->ne[2] : 1) <= 8192;
+}
+
+static uint64_t ggml_metalium_padded_volume(const std::array<uint32_t, GGML_MAX_DIMS> & shape) {
+    auto tile_pad = [](uint64_t n) { return (n + tt::constants::TILE_HEIGHT - 1) / tt::constants::TILE_HEIGHT * tt::constants::TILE_HEIGHT; };
+    return (uint64_t)shape[0] * shape[1] * tile_pad(shape[2]) * tile_pad(shape[3]);
+}
+
+// Whether a TT shape is `want`, ignoring leading ones on either side (as ggml_tt_shape_equal does).
+static bool ggml_metalium_tt_shape_is(const ttnn::Shape & shape, const std::array<uint32_t, GGML_MAX_DIMS> & want) {
+    const int rank = (int)shape.rank();
+    for (int i = 0; i < std::max(rank, GGML_MAX_DIMS); i++) {
+        const uint32_t have = i < rank ? shape[rank - 1 - i] : 1;
+        const uint32_t need = i < GGML_MAX_DIMS ? want[GGML_MAX_DIMS - 1 - i] : 1;
+        if (have != need) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The fold to upload a tensor with, 0 for none. Only contiguous float tensors fold, and
+// GGML_METALIUM_FOLD=1 also wants the padded size to shrink at least 4x.
+static int ggml_metalium_choose_fold(const ggml_tensor * t) {
+    if (g_debug_flags.fold == 0 || !(t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16) ||
+        !ggml_is_contiguous(t) || ggml_n_dims(t) < 2) {
+        return 0;
+    }
+    const uint64_t natural = ggml_metalium_padded_volume({(uint32_t)t->ne[3], (uint32_t)t->ne[2], (uint32_t)t->ne[1], (uint32_t)t->ne[0]});
+    int best = 0;
+    uint64_t best_volume = natural;
+    for (int g : {2, 3}) {
+        if (!ggml_metalium_fold_fits(t, g)) {
+            continue;
+        }
+        const uint64_t volume = ggml_metalium_padded_volume(ggml_metalium_fold_shape(t, g));
+        if (volume < best_volume) {
+            best = g;
+            best_volume = volume;
+        }
+    }
+    if (g_debug_flags.fold == 1 && best_volume * 4 > natural) {
+        return 0;
+    }
+    return best;
+}
+
+// 0 when `shape` is t's natural TT shape, g when it is ggml_metalium_fold_shape(t, g), else -1
+static int ggml_metalium_fold_of(const ggml_tensor * t, const ttnn::Shape & shape) {
+    if (ggml_tt_shape_equal(t, shape)) {
+        return 0;
+    }
+    for (int g : {2, 3}) {
+        if (ggml_metalium_fold_fits(t, g) && ggml_metalium_tt_shape_is(shape, ggml_metalium_fold_shape(t, g))) {
+            return g;
+        }
+    }
+    return -1;
+}
+
+// Whether meta->tensor has the TT shape its flags describe for t
+static bool ggml_metalium_layout_ok(const ggml_tensor * t, const ggml_tensor_extra_metalium * meta) {
+    if (meta->is_flat_kernel || meta->is_pretransposed) {
+        return true;
+    }
+    if (meta->fold != 0) {
+        return ggml_metalium_tt_shape_is(meta->tensor->logical_shape(), ggml_metalium_fold_shape(t, meta->fold));
+    }
+    return ggml_tt_tensors_shape_equal(t, *meta->tensor);
+}
+
+// GGML_METALIUM_FOLD_STATS=1 prints how often tensors were uploaded folded, read folded, and
+// restored to their ggml shape, when the process exits.
+struct ggml_metalium_fold_stats {
+    std::mutex mu;
+    std::map<std::string, size_t> counts;
+
+    void bump(const char * what, const ggml_tensor * t, int g) {
+        if (!g_debug_flags.fold_stats) {
+            return;
+        }
+        std::string key = fmt::format("{}: g={} ne=[{},{},{},{}]", what, g, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+        std::lock_guard<std::mutex> lock(mu);
+        counts[key]++;
+    }
+
+    ~ggml_metalium_fold_stats() {
+        if (counts.empty()) {
+            return;
+        }
+        fmt::println(stderr, "\n[fold] histogram:");
+        for (const auto & [k, v] : counts) {
+            fmt::println(stderr, "  {:>8}  {}", v, k);
+        }
+    }
+};
+
+static ggml_metalium_fold_stats g_fold_stats;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 // Backend internal state tracking because GGML API does not allow
@@ -640,7 +766,8 @@ static bool is_integer_type(ggml_type type)
     return std::find(integer_types.begin(), integer_types.end(), type) != integer_types.end();
 }
 
-static ttnn::Tensor reshape_tt_tensor_into_ggml(const ttnn::Tensor& tensor, const struct ggml_tensor * node)
+static ttnn::Tensor reshape_tt_tensor_into_ggml(const ttnn::Tensor& tensor, const struct ggml_tensor * node,
+                                                bool zero_padding = false)
 {
     if(ggml_tt_tensors_shape_equal(node, tensor)) {
         return tensor;
@@ -652,7 +779,20 @@ static ttnn::Tensor reshape_tt_tensor_into_ggml(const ttnn::Tensor& tensor, cons
     }
 
     // std::cerr << "Reshaping tensor " << tensor.logical_shape() << " to " << target_shape << std::endl;
+    if(zero_padding) {
+        // Only an explicit pad value makes a tiled ReshapeView fill its output's tile padding
+        return ttnn::reshape(tensor, ttnn::Shape(target_shape), std::nullopt, 0.0f);
+    }
     return ttnn::reshape(tensor, ttnn::Shape(target_shape));
+}
+
+// A folded tensor restored to node's ggml shape, for consumers that index it by ggml dims.
+// Reshaping out of a fold leaves other lanes' data in the new tile padding, but consumers that
+// reduce whole tiles (the custom matmul's K tail) rely on an upload's padding being zero.
+static ttnn::Tensor ggml_metalium_unfold(const ggml_tensor * node, const ggml_tensor_extra_metalium & meta)
+{
+    g_fold_stats.bump("restore", node, meta.fold);
+    return reshape_tt_tensor_into_ggml(*meta.tensor, node, /*zero_padding=*/true);
 }
 
 // Block-float (BFLOAT8_B / BFLOAT4_B) is the on-device storage for quantized weights. TTNN ops
@@ -678,6 +818,72 @@ static std::shared_ptr<ttnn::Tensor> realize_ggml_view(const ggml_tensor* tensor
     return res;
 }
 
+struct ggml_metalium_flat {
+    std::shared_ptr<ttnn::Tensor> tensor;
+    int fold;     // relative to the node, as ggml_metalium_fold_of() reports it
+    bool folded;  // tensor is the storage of a folded tensor
+};
+
+// A tensor whose row-major element order is t's ggml order, like realize_ggml_view(t), but a
+// folded tensor under t is handed back as is instead of being restored.
+static ggml_metalium_flat ggml_metalium_realize_flat(const ggml_tensor * t, bool keep_block_float = false)
+{
+    const ggml_tensor * src0 = t->src[0];
+    bool same_order = false;
+    if(t->op == GGML_OP_RESHAPE) {
+        same_order = true;
+    }
+    else if(t->op == GGML_OP_VIEW) {
+        size_t offset = 0;
+        memcpy(&offset, t->op_params, sizeof(offset));
+        same_order = offset == 0 && ggml_nelements(src0) == ggml_nelements(t);
+    }
+    else if(t->op == GGML_OP_PERMUTE) {
+        // Moving only extent-1 axes keeps the element order
+        int32_t axes[GGML_MAX_DIMS];
+        memcpy(axes, t->op_params, sizeof(axes));
+        same_order = true;
+        for(int i = 0; i < GGML_MAX_DIMS; i++) {
+            for(int j = i + 1; j < GGML_MAX_DIMS; j++) {
+                same_order = same_order && (src0->ne[i] == 1 || src0->ne[j] == 1 || axes[i] < axes[j]);
+            }
+        }
+    }
+    if(same_order) {
+        auto res = ggml_metalium_realize_flat(src0, keep_block_float);
+        return {res.tensor, ggml_metalium_fold_of(t, res.tensor->logical_shape()), res.folded};
+    }
+
+    const auto * meta = (const ggml_tensor_extra_metalium *)t->extra;
+    const bool view_op = t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
+                         t->op == GGML_OP_TRANSPOSE;
+    if(!view_op && meta != nullptr && meta->tensor != nullptr && !meta->is_flat_kernel && !meta->is_pretransposed) {
+        auto res = meta->tensor;
+        if(!keep_block_float && tt_dtype_is_block_float(res->dtype())) {
+            res = std::make_shared<ttnn::Tensor>(ttnn::typecast(*res, tt::tt_metal::DataType::BFLOAT16));
+        }
+        return {res, ggml_metalium_fold_of(t, res->logical_shape()), meta->fold != 0};
+    }
+    return {realize_ggml_view(t, keep_block_float), 0, false};
+}
+
+// The parent of a node that only relabels src0's element order: realize_flat(src0), which the
+// node reshapes into its own shape. A parent read out of a fold comes already reshaped, with
+// its tile padding zeroed as ggml_metalium_unfold() does.
+static std::shared_ptr<ttnn::Tensor> ggml_metalium_relabel_parent(const ggml_tensor * tensor, bool keep_block_float)
+{
+    auto flat = ggml_metalium_realize_flat(tensor->src[0], keep_block_float);
+    if(!flat.folded) {
+        return flat.tensor;
+    }
+    const bool same_shape = ggml_tt_tensors_shape_equal(tensor, *flat.tensor);
+    g_fold_stats.bump(same_shape ? "read folded" : "reshape folded", tensor->src[0], flat.fold);
+    if(same_shape) {
+        return flat.tensor;
+    }
+    return std::make_shared<ttnn::Tensor>(reshape_tt_tensor_into_ggml(*flat.tensor, tensor, /*zero_padding=*/true));
+}
+
 
 static std::shared_ptr<ttnn::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor, bool keep_block_float)
 {
@@ -700,13 +906,13 @@ static std::shared_ptr<ttnn::Tensor> realize_ggml_view_impl(const ggml_tensor* t
         // needs the VIEW's own offset; view_offs is cumulative down to view_src.
         size_t offset = 0;
         memcpy(&offset, tensor->op_params, sizeof(offset));
+        const bool is_reshape = offset == 0 && ggml_nelements(src0) == ggml_nelements(tensor);
 #ifdef GGML_METALIUM_TTPRM
         // A view that is really a reshape is metadata-only for TTNN, so ttprm's
         // gather would be strictly more expensive than what we already do. Offer
         // it only the views that currently cost a slice -- and usually a reshape
         // on one or both sides of it.
-        if(!keep_block_float &&
-           !(offset == 0 && ggml_nelements(src0) == ggml_nelements(tensor))) {
+        if(!keep_block_float && !is_reshape) {
             if(auto fused = ggml_ttprm::realize_view(tensor)) {
                 return fused;
             }
@@ -718,7 +924,8 @@ static std::shared_ptr<ttnn::Tensor> realize_ggml_view_impl(const ggml_tensor* t
         // the in-place result lives in a FRESH tensor that IS src0, while the base buffer
         // still holds stale pre-op data.  The offset/stride math below already uses src0,
         // so reading the parent from src0 keeps them consistent and reads the correct data.
-        std::shared_ptr<ttnn::Tensor> parent = realize_ggml_view(src0, keep_block_float);
+        std::shared_ptr<ttnn::Tensor> parent = is_reshape ? ggml_metalium_relabel_parent(tensor, keep_block_float)
+                                                          : realize_ggml_view(src0, keep_block_float);
         std::array dst_size = std::to_array(tensor->ne);
         std::array dst_stride = std::to_array(tensor->nb);
         std::array src_size = std::to_array(src0->ne);
@@ -800,7 +1007,7 @@ static std::shared_ptr<ttnn::Tensor> realize_ggml_view_impl(const ggml_tensor* t
         }
 
         // Actually a reshape written as a view
-        if(offset == 0 && ggml_nelements(src0) == ggml_nelements(tensor)) {
+        if(is_reshape) {
             res = reshape_tt_tensor_into_ggml(*parent, tensor);
         }
         // Trying to convert a flat 1D tensor to N-D tensor (with an offset, else's it's the above case)
@@ -882,7 +1089,7 @@ static std::shared_ptr<ttnn::Tensor> realize_ggml_view_impl(const ggml_tensor* t
         return std::make_shared<ttnn::Tensor>(std::move(res));
     }
     if(op == GGML_OP_RESHAPE) {
-        auto t = realize_ggml_view(src0, keep_block_float);
+        auto t = ggml_metalium_relabel_parent(tensor, keep_block_float);
         return std::make_shared<ttnn::Tensor>(reshape_tt_tensor_into_ggml(*t, tensor));
     }
     if(op == GGML_OP_PERMUTE) {
@@ -947,6 +1154,9 @@ static std::shared_ptr<ttnn::Tensor> realize_ggml_view_impl(const ggml_tensor* t
         }
         if(meta->is_flat_kernel) {
             return std::make_shared<ttnn::Tensor>(reshape_tt_tensor_into_ggml(*meta->tensor, tensor));
+        }
+        if(meta->fold != 0) {
+            return std::make_shared<ttnn::Tensor>(ggml_metalium_unfold(tensor, *meta));
         }
         return meta->tensor;
     }
@@ -1070,6 +1280,7 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
                 aT = ttnn::transpose(a, -2, -1);
                 meta0->tensor = std::make_shared<ttnn::Tensor>(aT);
                 meta0->is_pretransposed = true;
+                meta0->fold = 0;
             }
         }
         else {
@@ -1348,7 +1559,9 @@ static void ggml_backend_metalium_set(ggml_backend_metalium_context * ctx, struc
     int batch_idx = offset / nb2;
     GGML_ASSERT(offset < nb3);
     GGML_ASSERT(offset % nb1 == 0);
-    auto res = ttnn::update_cache(*src0_meta->tensor, *src1_meta->tensor, idx, batch_idx);
+    GGML_ASSERT(src1_meta->fold == 0);
+    const ttnn::Tensor cache = src0_meta->fold != 0 ? ggml_metalium_unfold(dst->src[0], *src0_meta) : *src0_meta->tensor;
+    auto res = ttnn::update_cache(cache, *src1_meta->tensor, idx, batch_idx);
     if(!inplace) {
         *dst_meta = {
             .tensor = std::make_shared<ttnn::Tensor>(res),
@@ -3384,7 +3597,7 @@ static bool ggml_backend_metalium_buffer_set_tensor_impl(ggml_backend_buffer_t b
 
     // Make sure we are not writing to a view tensor
     if(size != ggml_nbytes(tensor) ||
-        (meta->tensor && !meta->is_flat_kernel && ggml_tt_tensors_shape_equal(tensor, *meta->tensor) == false)
+        (meta->tensor && !ggml_metalium_layout_ok(tensor, meta))
         || tensor->view_src != NULL) {
         // FIXME: Reenable this when got time
         // fprintf(stderr, "Warning: Metalium set_tensor() does not work with tensor views\n");
@@ -3505,6 +3718,19 @@ static bool ggml_backend_metalium_buffer_set_tensor_impl(ggml_backend_buffer_t b
         shape[3] = row;
     }
 
+    // Weights are read on every step, by consumers that need their ggml shape
+    int fold = 0;
+    if(tilize && !flat_kernel && buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS && !permute.has_value()) {
+        fold = ggml_metalium_choose_fold(tensor);
+    }
+    if(fold != 0) {
+        const auto folded = ggml_metalium_fold_shape(tensor, fold);
+        for(int i = 0; i < GGML_MAX_DIMS; i++) {
+            shape[i] = folded[i];
+        }
+        g_fold_stats.bump("upload", tensor, fold);
+    }
+
     ttnn::Tensor t(std::move(*storage), ttnn::Shape(shape)
         , intermidiate_type, tt::tt_metal::Layout::ROW_MAJOR);
 
@@ -3532,12 +3758,13 @@ static bool ggml_backend_metalium_buffer_set_tensor_impl(ggml_backend_buffer_t b
 
         GGML_ASSERT(t.storage_type() == ttnn::StorageType::DEVICE);
         GGML_ASSERT(t.dtype() == final_type);
-        GGML_ASSERT(flat_kernel || ggml_tt_tensors_shape_equal(tensor, t));
         GGML_ASSERT(t.layout() == (tilize ? tt::tt_metal::Layout::TILE : tt::tt_metal::Layout::ROW_MAJOR));
         *meta = ggml_tensor_extra_metalium {
             .tensor = std::make_shared<ttnn::Tensor>(std::move(t)),
             .is_flat_kernel = flat_kernel,
+            .fold = (uint8_t)fold,
         };
+        GGML_ASSERT(ggml_metalium_layout_ok(tensor, meta));
         ggml_metalium_release_range(tensor, false, true);
 
         // Lightweight, env-gated upload probe (mirrors GGML_METALIUM_DUMP_MEM). Set
@@ -3613,7 +3840,7 @@ static void ggml_backend_metalium_buffer_get_tensor_impl(ggml_backend_buffer_t b
         // XXX: This only handles the case where the permute is the only view class operation
         // May broke if there are multiple permutes
         ggml_tensor* src = tensor->src[0];
-        t = realize_ggml_view(src);
+        t = ggml_metalium_realize_flat(src).tensor;
     }
     else if (tensor->op == GGML_OP_RESHAPE) {
         // No reason to do actual reshaping as it doesn't make a difference in row-major layout
@@ -3623,7 +3850,13 @@ static void ggml_backend_metalium_buffer_get_tensor_impl(ggml_backend_buffer_t b
             GGML_ASSERT(src != NULL);
         }
         GGML_ASSERT(src != NULL);
-        t = realize_ggml_view(src);
+        t = ggml_metalium_realize_flat(src).tensor;
+    }
+    else if (const auto * meta = (const ggml_tensor_extra_metalium *)tensor->extra;
+             meta->fold != 0 && meta->tensor != nullptr && !ggml_metalium_is_view_op(tensor)) {
+        // Read back row-major, a folded tensor is already in ggml order
+        g_fold_stats.bump("read back folded", tensor, meta->fold);
+        t = meta->tensor;
     }
     else {
         t = realize_ggml_view(tensor);
@@ -3715,6 +3948,7 @@ ggml_backend_metalium_buffer_cpy_tensor_impl(ggml_backend_buffer_t buffer,
     dst_meta->tensor = std::make_shared<ttnn::Tensor>(std::move(ret));
     dst_meta->is_pretransposed = src_meta->is_pretransposed;
     dst_meta->is_flat_kernel = src_meta->is_flat_kernel;
+    dst_meta->fold = src_meta->fold;
     ggml_metalium_release_range(dst, false, true);
     return true;
 }
@@ -3884,7 +4118,8 @@ static void ggml_metalium_alias_inplace_parents(struct ggml_tensor * node) {
     if (node->view_src == nullptr || node->buffer == nullptr) {
         return;
     }
-    const auto & result = ((ggml_tensor_extra_metalium *)node->extra)->tensor;
+    const auto * node_meta = (ggml_tensor_extra_metalium *)node->extra;
+    const auto & result = node_meta->tensor;
     struct ggml_tensor * parent = node->src[0];
     while (parent != nullptr) {
         parent = find_mem_holder(parent);
@@ -3897,6 +4132,7 @@ static void ggml_metalium_alias_inplace_parents(struct ggml_tensor * node) {
             return;
         }
         meta->tensor = result;
+        meta->fold = node_meta->fold;
         ggml_metalium_release_range(parent, false, true);
         parent = parent->view_src != nullptr ? parent->src[0] : nullptr;
     }
@@ -4176,7 +4412,7 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
         GGML_ASSERT(meta != NULL);
         GGML_ASSERT(meta->tensor != NULL);
         GGML_ASSERT(meta->tensor->storage_type() == ttnn::StorageType::DEVICE);
-        if(!ggml_tt_tensors_shape_equal(node, *meta->tensor)) {
+        if(!ggml_metalium_layout_ok(node, meta)) {
             fmt::println(stderr, "Mismatched tensor shapes for node '{}' ({}): GGML wants [{}, {}, {}, {}], TTNN generates {}\n"
                 , node->name, ggml_op_name(node->op), node->ne[0], node->ne[1], node->ne[2], node->ne[3], meta->tensor->logical_shape());
             abort();

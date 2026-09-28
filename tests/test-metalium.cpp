@@ -184,6 +184,8 @@ struct test_case
     float max_err = 1e-4;
     std::function<double(const float*, const float*, size_t n)> loss;
     std::function<ggml_tensor* (ggml_context*)> build_graph;
+    // Runs once the tensors hold data; returning false fails the test
+    std::function<bool(ggml_context*)> after_init;
 
     static const int sentinel_size = 1024;
     std::vector<ggml_tensor *> sentinels;
@@ -248,6 +250,13 @@ struct test_case
 
         // randomize tensors
         initialize_tensors(ctx);
+
+        if (after_init && !after_init(ctx)) {
+            printf("after_init check failed \033[1;31mFAIL\033[0m\n");
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return TestResult::FAIL;
+        }
 
         // compare
         struct callback_userdata {
@@ -1754,6 +1763,87 @@ int main(int argc, char ** argv)
         ggml_tensor* r = ggml_repeat(ctx, c, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 40, 48, 2));
         return ggml_mul_mat(ctx, ggml_exp(ctx, a), ggml_cont(ctx, ggml_transpose(ctx, r)));
     }, "MatMul K=48 of exp(a) and a transposed row-broadcast REPEAT (pad rows)"));
+
+    // Leaves with tiny low dims are uploaded folded under GGML_METALIUM_FOLD. Ops that do not
+    // know about folds read them restored to their ggml shape.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, 64, 97);
+        return ggml_soft_max(ctx, x);
+    }, "SOFT_MAX of a [2,2,64,97] leaf", 1e-3));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, 64, 97);
+        return ggml_rms_norm(ctx, x, 1e-6f);
+    }, "RMS_NORM of a [2,2,64,97] leaf", 1e-3));
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, 64, 97);
+        return ggml_scale(ctx, x, 0.5f);
+    }, "SCALE of a [2,2,64,97] leaf"));
+
+    // [128,97,3] is the fold of a [2,64,97,3] leaf, so this reshape reads it as uploaded.
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 97, 3);
+        return ggml_scale(ctx, ggml_reshape_3d(ctx, x, 128, 97, 3), 0.5f);
+    }, "SCALE of RESHAPE_3D([2,64,97,3] -> [128,97,3])"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 97, 3);
+        ggml_tensor* y = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 97, 3);
+        return ggml_add(ctx, ggml_reshape_4d(ctx, x, 2, 64, 97, 3), y);
+    }, "ADD of RESHAPE_4D([128,97,3] -> [2,64,97,3]) and a [2,64,97,3] leaf"));
+
+    // A second upload must replace the first, folded or not. The CPU reference reads the leaf
+    // back from the device, so only this check can tell a dropped upload.
+    {
+        auto tc = make_exact_test([](ggml_context* ctx) {
+            ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, 64, 97);
+            ggml_set_name(x, "reuploaded");
+            return ggml_scale(ctx, x, 0.5f);
+        }, "SCALE of a [2,2,64,97] leaf uploaded twice");
+        tc->after_init = [](ggml_context* ctx) {
+            ggml_tensor* x = ggml_get_tensor(ctx, "reuploaded");
+            std::vector<float> negated = tensor_to_float(x);
+            for (float& v : negated) {
+                v = -v;
+            }
+            ggml_backend_tensor_set(x, negated.data(), 0, ggml_nbytes(x));
+            return tensor_to_float(x) == negated;
+        };
+        tests.push_back(std::move(tc));
+    }
+
+    // Under GGML_METALIUM_FOLD these leaves are uploaded folded. The matmul reduces over whole K
+    // tiles, so restoring them, or reshaping them out of the fold, must zero the tile padding as a
+    // natural upload does.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 32, 64);
+        ggml_tensor* b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 4, 64);
+        return ggml_mul_mat(ctx, a, b);
+    }, "MatMul K=8 of two [8,x,64] leaves (pad lanes)"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 48, 8, 128);
+        ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 48, 4, 16, 8);
+        return ggml_mul_mat(ctx, ggml_exp(ctx, a), ggml_reshape_3d(ctx, x, 48, 4, 128));
+    }, "MatMul K=48 of exp(a) and RESHAPE_3D of a [48,4,16,8] leaf (pad lanes)"));
+
+    // Under GGML_METALIUM_FOLD src0 is uploaded folded. update_cache writes row 1 of every batch,
+    // the ones past batch 0 from b's zero pad rows, so those rows start zeroed to match ggml.
+    {
+        auto tc = make_exact_test([](ggml_context* ctx) {
+            ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 2, 1, 16);
+            ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
+            ggml_set_name(a, "set_src0");
+            return ggml_set_2d(ctx, a, b, a->nb[1], a->nb[1]);
+        }, "Set row 1 of a [32,2,1,16] leaf");
+        tc->after_init = [](ggml_context* ctx) {
+            ggml_tensor* a = ggml_get_tensor(ctx, "set_src0");
+            std::vector<float> v = tensor_to_float(a);
+            for (int64_t i3 = 1; i3 < a->ne[3]; i3++) {
+                std::fill_n(v.begin() + (i3 * a->ne[1] + 1) * a->ne[0], a->ne[0], 0.0f);
+            }
+            ggml_backend_tensor_set(a, v.data(), 0, ggml_nbytes(a));
+            return true;
+        };
+        tests.push_back(std::move(tc));
+    }
 
     ///////////////// end of experiment code /////////////////
 
