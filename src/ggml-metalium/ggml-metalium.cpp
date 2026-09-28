@@ -94,6 +94,7 @@
 #include "tmp_soft_max.hpp"
 #include "flux_rope.hpp"
 #include "graph_report.hpp"
+#include "lane_remap.hpp"
 #include "metalium_layout.hpp"
 
 extern void metalium_register_all_kernel();
@@ -102,8 +103,8 @@ struct ggml_backend_metalium_context {
     ttnn::IDevice* device = nullptr;
     int device_id = 0;
     std::string name;
-    // 0/1 lane selection matrices of the planned-op executor, keyed by {base row width, lanes...}
-    std::map<std::vector<int32_t>, std::shared_ptr<ttnn::Tensor>> lane_selectors;
+    // lane_remap run tables on the device, keyed by their content
+    std::map<std::vector<uint32_t>, std::shared_ptr<ttnn::Tensor>> lane_tables;
 };
 
 struct ggml_backend_metalium_device_context {
@@ -1476,7 +1477,14 @@ static int ggml_metalium_want_fold(const ggml_tensor * t)
 struct ggml_metalium_planned {
     const ttnn::Tensor * base = nullptr;
     ml_plan plan;
+    ml_remap remap;  // empty table when the plan is the base itself or one slice of it
 };
+
+// Whether ttnn::slice alone runs the plan: one plane of whole lanes or a tile-aligned lane window
+static bool ggml_metalium_plan_is_slice(const ml_plan & plan)
+{
+    return plan.planes.size() == 1 && plan.planes[0].op != ml_lane_op::gather;
+}
 
 // Plans acc's node as the TT shape ml_coarsen(ne, g_out). Returns nullptr, or why it cannot.
 static const char * ggml_metalium_plan(const ml_access & acc, int g_out, ggml_metalium_planned & out)
@@ -1500,99 +1508,84 @@ static const char * ggml_metalium_plan(const ml_access & acc, int g_out, ggml_me
         dims[i] = shape[i];
     }
     out.base = &base;
-    if (const char * why = ml_plan_row_local(acc, g_out, ml_grid_of(dims.data(), (int)shape.rank()), out.plan)) {
-        return why;
-    }
-    // Every plane but a duplicate is a slice (and a matmul) of its own. Measured on attention head
-    // splits, plans of more planes lose to the natural reshape + permute unless the tensor is large.
-    if (std::ranges::count_if(out.plan.planes, [](const ml_plane & p) { return p.dup_of < 0; }) > 4) {
-        return "more than 4 planes";
-    }
-    // The selection matmul reduces over whole K tiles, so the base's pad lanes must not exist
-    for (const ml_plane & p : out.plan.planes) {
-        if (p.dup_of < 0 && p.op == ml_lane_op::gather &&
-            (out.plan.in.W % tt::constants::TILE_WIDTH != 0 || out.plan.in.W * out.plan.W_out > (1 << 20))) {
-            return "lane gather needs tile-aligned base rows";
+    const ml_grid in = ml_grid_of(dims.data(), (int)shape.rank());
+    const auto cores = base.device()->compute_with_storage_grid_size();
+    const int64_t workers = 2 * (int64_t)cores.x * cores.y;
+
+    // Plans repeat across the layers of a model, and one of many planes takes tens of microseconds
+    struct memo {
+        const char * why;
+        ml_plan plan;
+        ml_remap remap;
+    };
+    struct key_hash {
+        size_t operator()(const std::vector<int64_t> & k) const {
+            uint64_t h = 0xcbf29ce484222325ull;
+            for (int64_t v : k) {
+                h = (h ^ (uint64_t)v) * 0x100000001b3ull;
+            }
+            return (size_t)h;
         }
+    };
+    static std::mutex memo_mutex;
+    static std::unordered_map<std::vector<int64_t>, memo, key_hash> memos;
+    std::vector<int64_t> key = {g_out, in.blocks, in.R, in.W, workers, acc.offset};
+    key.insert(key.end(), acc.ne, acc.ne + GGML_MAX_DIMS);
+    key.insert(key.end(), acc.ne_src, acc.ne_src + GGML_MAX_DIMS);
+    key.insert(key.end(), acc.st, acc.st + GGML_MAX_DIMS);
+    std::lock_guard<std::mutex> lock(memo_mutex);
+    auto it = memos.find(key);
+    if (it == memos.end()) {
+        if (memos.size() >= 4096) {
+            memos.clear();
+        }
+        memo m{};
+        m.why = ml_plan_row_local(acc, g_out, in, m.plan);
+        if (m.why == nullptr && !m.plan.identity() && !ggml_metalium_plan_is_slice(m.plan)) {
+            m.why = ml_build_remap(m.plan, workers, m.remap);
+        }
+        it = memos.emplace(std::move(key), std::move(m)).first;
     }
+    if (it->second.why != nullptr) {
+        return it->second.why;
+    }
+    if (!it->second.remap.table.empty() && base.memory_config().is_sharded()) {
+        return "base is sharded";
+    }
+    out.plan = it->second.plan;
+    out.remap = it->second.remap;
     return nullptr;
 }
 
-// A bf16 [1, 1, W_in, W_out] matrix with a 1 at (lanes[c], c): x @ S picks lane lanes[c] of each row
-static const ttnn::Tensor & ggml_metalium_lane_selector(ggml_backend_metalium_context * ctx, int64_t W_in,
-                                                        const std::vector<int32_t> & lanes, ttnn::MeshDevice * device)
-{
-    std::vector<int32_t> key;
-    key.reserve(lanes.size() + 1);
-    key.push_back((int32_t)W_in);
-    key.insert(key.end(), lanes.begin(), lanes.end());
-    auto it = ctx->lane_selectors.find(key);
-    if (it == ctx->lane_selectors.end()) {
-        const size_t W_out = lanes.size();
-        std::vector<float> host((size_t)W_in * W_out, 0.0f);
-        for (size_t c = 0; c < W_out; c++) {
-            if (lanes[c] >= 0) {
-                host[(size_t)lanes[c] * W_out + c] = 1.0f;
-            }
-        }
-        ttnn::Tensor sel(host_data_to_tt_host_buffer<float, bfloat16>(host.data(), host.size()),
-                         ttnn::Shape({1, 1, (uint32_t)W_in, (uint32_t)W_out}), tt::tt_metal::DataType::BFLOAT16,
-                         tt::tt_metal::Layout::ROW_MAJOR);
-        sel = ttnn::tilize_with_zero_padding(sel.to_device(device), std::nullopt, tt::tt_metal::DataType::BFLOAT16);
-        it = ctx->lane_selectors.emplace(std::move(key), std::make_shared<ttnn::Tensor>(std::move(sel))).first;
-    }
-    return *it->second;
-}
-
-// Runs a plan with stock ttnn ops: a slice per plane, a selection matmul for lanes that are not a
-// tile-aligned window, then a concat of the planes. The matmul copies finite values exactly; Inf,
-// NaN, -0 and subnormals follow the FPU's rules rather than IEEE's (on Blackhole 0 x Inf is 0, so
-// an Inf passes through). With `copy`, a plan that moves nothing still returns a tensor of its own
-// rather than the base.
-static std::shared_ptr<ttnn::Tensor> ggml_metalium_execute_plan_stock(ggml_backend_metalium_context * ctx,
-                                                                      const ggml_metalium_planned & planned, bool copy)
+// Runs a plan: nothing for the base itself, ttnn::slice for one slice of it, else one lane_remap.
+// With `copy`, a plan that moves nothing still returns a tensor of its own rather than the base.
+static std::shared_ptr<ttnn::Tensor> ggml_metalium_execute_plan(ggml_backend_metalium_context * ctx,
+                                                                const ggml_metalium_planned & planned, bool copy)
 {
     const ml_plan & plan = planned.plan;
-    const ml_grid & in = plan.in;
     const auto u32 = [](int64_t v) { return (uint32_t)v; };
-    // make_compute_kernel_config drops to HiFi2 under GGML_METALIUM_LOW_FIDELITY, which would round
-    // the selected values; bf16 x 1 accumulated in fp32 is exact at HiFi4.
-    const ttnn::DeviceComputeKernelConfig exact_cfg = ttnn::WormholeComputeKernelConfig{
-        .math_fidelity = MathFidelity::HiFi4, .math_approx_mode = false, .fp32_dest_acc_en = true, .packer_l1_acc = false};
-
-    const ttnn::Tensor flat = ttnn::reshape(*planned.base, ttnn::Shape({1, u32(in.blocks), u32(in.R), u32(in.W)}));
-    std::vector<ttnn::Tensor> pieces;
-    for (const ml_plane & p : plan.planes) {
-        if (p.dup_of >= 0) {
-            ttnn::Tensor dup = pieces[p.dup_of];
-            pieces.push_back(std::move(dup));
-            continue;
+    const ttnn::Shape out_shape({u32(plan.out_shape[0]), u32(plan.out_shape[1]), u32(plan.out_shape[2]),
+                                 u32(plan.out_shape[3])});
+    if (!planned.remap.table.empty()) {
+        auto it = ctx->lane_tables.find(planned.remap.table);
+        if (it == ctx->lane_tables.end()) {
+            auto table = std::make_shared<ttnn::Tensor>(ttggml::lane_remap_table(planned.remap, planned.base->device()));
+            it = ctx->lane_tables.emplace(planned.remap.table, std::move(table)).first;
         }
-        const bool window = p.op == ml_lane_op::window;
-        const int64_t c0 = window ? p.lanes[0] : 0;
-        const int64_t w = window ? plan.W_out : in.W;
-        ttnn::Tensor piece = flat;
-        if (p.blk0 != 0 || p.nblk != in.blocks || p.row0 != 0 || p.nrow != in.R || w != in.W) {
-            const std::array<uint32_t, GGML_MAX_DIMS> begins = {0, u32(p.blk0), u32(p.row0), u32(c0)};
-            const std::array<uint32_t, GGML_MAX_DIMS> ends = {1, u32(p.blk0 + p.nblk), u32(p.row0 + p.nrow), u32(c0 + w)};
-            const std::array<uint32_t, GGML_MAX_DIMS> step = {1, 1, 1, 1};
-            piece = ttnn::slice(flat, begins, ends, step, std::nullopt, std::nullopt, 0.0f);
-        }
-        if (p.op == ml_lane_op::gather) {
-            const ttnn::Tensor & sel = ggml_metalium_lane_selector(ctx, in.W, p.lanes, piece.device());
-            piece = ttnn::reshape(piece, ttnn::Shape({u32(p.nblk), 1, u32(p.nrow), u32(in.W)}));
-            piece = ttnn::operations::matmul::matmul(piece, sel, false, false, std::nullopt, std::nullopt,
-                                                     std::nullopt, std::nullopt, exact_cfg);
-            piece = ttnn::reshape(piece, ttnn::Shape({1, u32(p.nblk), u32(p.nrow), u32(plan.W_out)}));
-        }
-        pieces.push_back(std::move(piece));
+        return std::make_shared<ttnn::Tensor>(ttggml::lane_remap(*planned.base, plan, planned.remap, *it->second));
     }
-    ttnn::Tensor res = pieces.size() == 1 ? pieces[0] : ttnn::concat(pieces, 1);
-    std::array<uint32_t, GGML_MAX_DIMS> out;
-    for (int i = 0; i < GGML_MAX_DIMS; i++) {
-        out[i] = u32(plan.out_shape[i]);
+    const ml_grid & in = plan.in;
+    ttnn::Tensor res = ttnn::reshape(*planned.base, ttnn::Shape({1, u32(in.blocks), u32(in.R), u32(in.W)}));
+    if (!plan.identity()) {
+        GGML_ASSERT(ggml_metalium_plan_is_slice(plan));
+        const ml_plane & p = plan.planes[0];
+        const int64_t c0 = p.op == ml_lane_op::window ? p.lanes[0] : 0;
+        const std::array<uint32_t, GGML_MAX_DIMS> begins = {0, u32(p.blk0), u32(p.row0), u32(c0)};
+        const std::array<uint32_t, GGML_MAX_DIMS> ends = {1, u32(p.blk0 + p.nblk), u32(p.row0 + p.nrow), u32(c0 + plan.W_out)};
+        const std::array<uint32_t, GGML_MAX_DIMS> step = {1, 1, 1, 1};
+        res = ttnn::slice(res, begins, ends, step, std::nullopt, std::nullopt, 0.0f);
     }
-    res = ttnn::reshape(res, ttnn::Shape(out));
+    res = ttnn::reshape(res, out_shape);
     if (copy && plan.identity()) {
         // Stored results must not alias the base, whose lifetime ends with its own last use
         res = ttnn::typecast(res, res.dtype());
@@ -1607,9 +1600,9 @@ static void ggml_metalium_plan_declined(const char * site, const char * why, con
     }
 }
 
-// Copies whose base is folded, or whose chain touches a tensor that tile padding dominates, are
-// planned. Anything else keeps the existing path (TransposeHC, ttprm gathers, reshape + permute
-// head splits), which is cheap when no padding-dominated tensor gets materialized.
+// Copies whose base is folded, whose chain touches a tensor that tile padding dominates, or whose
+// chain reshapes the lanes (an attention head split, which ttnn::reshape would move through tile
+// padding) are planned. Anything else keeps the existing path (TransposeHC, ttprm gathers).
 static bool ggml_metalium_copy_is_expensive(const ggml_tensor * dst, const ggml_tensor * base)
 {
     const auto * meta = (const ggml_tensor_extra_metalium *)base->extra;
@@ -1619,6 +1612,10 @@ static bool ggml_metalium_copy_is_expensive(const ggml_tensor * dst, const ggml_
     }
     for (const ggml_tensor * t = dst->src[0]; t != base; t = t->src[0]) {
         if (ggml_metalium_choose_fold(t) != 0) {
+            return true;
+        }
+        if ((t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && ggml_metalium_keeps_order(t) &&
+            !ml_reshape_is_view(ml_coarsen(t->src[0]->ne, 1), ml_coarsen(t->ne, 1))) {
             return true;
         }
     }
@@ -1657,7 +1654,7 @@ static bool ggml_metalium_try_planned_copy(ggml_backend_metalium_context * ctx, 
         ggml_metalium_plan_declined(site, why, dst, g_want);
         return false;
     }
-    auto res = ggml_metalium_execute_plan_stock(ctx, planned, /*copy=*/true);
+    auto res = ggml_metalium_execute_plan(ctx, planned, /*copy=*/true);
     if (dst->op == GGML_OP_CPY) {
         *(ggml_tensor_extra_metalium *)dst->src[1]->extra = {
             .tensor = res,
@@ -1694,7 +1691,7 @@ static bool ggml_metalium_try_planned_repeat(ggml_backend_metalium_context * ctx
         return false;
     }
     *(ggml_tensor_extra_metalium *)dst->extra = {
-        .tensor = ggml_metalium_execute_plan_stock(ctx, planned, /*copy=*/true),
+        .tensor = ggml_metalium_execute_plan(ctx, planned, /*copy=*/true),
         .fold = (uint8_t)g,
     };
     g_fold_stats.bump("REPEAT plan", dst, g);
@@ -1733,8 +1730,8 @@ static bool ggml_metalium_try_folded_bin_op(ggml_backend_metalium_context * ctx,
         ggml_metalium_plan_declined(ggml_op_name(op), reason, dst, g);
         return false;
     }
-    auto a = ggml_metalium_execute_plan_stock(ctx, planned[0], /*copy=*/false);
-    auto b = ggml_metalium_execute_plan_stock(ctx, planned[1], /*copy=*/false);
+    auto a = ggml_metalium_execute_plan(ctx, planned[0], /*copy=*/false);
+    auto b = ggml_metalium_execute_plan(ctx, planned[1], /*copy=*/false);
     ttnn::Tensor res;
     switch (op) {
         case GGML_OP_ADD:
@@ -5184,7 +5181,7 @@ static ggml_backend_t internal_backend_metalium_init(ggml_backend_metalium_devic
         /* device            = */ device,
         /* device_id         = */ device_id,
         /* name              = */ dev_ctx->name,
-        /* lane_selectors    = */ {},
+        /* lane_tables       = */ {},
     };
 
     ggml_backend_t backend = new ggml_backend {

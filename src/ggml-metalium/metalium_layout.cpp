@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
+#include <map>
+#include <tuple>
 
 static constexpr int64_t ML_TILE = 32;
 
@@ -156,8 +159,8 @@ const char * ml_plan_row_local(const ml_access & acc, int g_out, const ml_grid &
         plane = d;
     }
     const int64_t n_planes = plane < 0 ? 1 : acc.ne[plane];
-    if (n_planes > 16) {
-        return "more than 16 planes";
+    if (n_planes > 64) {
+        return "more than 64 planes";
     }
 
     for (int64_t q = 0; q < n_planes; q++) {
@@ -279,6 +282,171 @@ std::vector<float> ml_apply_plan_host(const ml_plan & plan, const std::vector<fl
         }
     }
     return out;
+}
+
+// A unit's slots, zero slot included, must stay addressable by 16-bit halfword offsets
+static constexpr int64_t ML_REMAP_MAX_SRC   = 32;
+static constexpr size_t  ML_REMAP_MAX_WORDS = 16384;
+
+// Halfword offset of element (r, c) in a tile of four 16x16 faces
+static int64_t ml_face_offset(int64_t r, int64_t c) {
+    return ((r >> 4) * 2 + (c >> 4)) * 256 + (r & 15) * 16 + (c & 15);
+}
+
+namespace {
+struct ml_record {
+    ml_run               run;
+    std::vector<int64_t> src;  // base lane tiles read, ascending
+};
+}  // namespace
+
+const char * ml_build_remap(const ml_plan & plan, int64_t workers, ml_remap & out) {
+    out                  = ml_remap{};
+    const ml_plane & p0  = plan.planes[0];
+    out.nblk             = p0.nblk;
+    out.nrow             = p0.nrow;
+    const int64_t ct_in  = (plan.in.W + ML_TILE - 1) / ML_TILE;
+    const int64_t rt_out = (p0.nrow + ML_TILE - 1) / ML_TILE;
+
+    std::vector<std::vector<uint32_t>> dsts(plan.planes.size());
+    for (size_t q = 0; q < plan.planes.size(); q++) {
+        GGML_ASSERT(plan.planes[q].row0 % ML_TILE == 0);
+        dsts[plan.planes[q].dup_of < 0 ? q : (size_t) plan.planes[q].dup_of].push_back((uint32_t) q);
+    }
+
+    std::vector<ml_record> recs;
+    for (const ml_run & run : ml_classify_runs(plan)) {
+        ml_record rec{run, {}};
+        if (run.page) {
+            rec.src.push_back(run.src_tile);
+        } else {
+            const ml_plane & p     = plan.planes[run.plane];
+            const int64_t    c0    = run.out_tile * ML_TILE;
+            const int64_t    valid = std::min(ML_TILE, plan.W_out - c0);
+            for (int64_t c = 0; c < valid; c++) {
+                if (p.lanes[c0 + c] >= 0) {
+                    rec.src.push_back(p.lanes[c0 + c] / ML_TILE);
+                }
+            }
+            std::sort(rec.src.begin(), rec.src.end());
+            rec.src.erase(std::unique(rec.src.begin(), rec.src.end()), rec.src.end());
+        }
+        recs.push_back(std::move(rec));
+    }
+    if (recs.size() * 18 + plan.planes.size() > ML_REMAP_MAX_WORDS) {
+        return "lane table too large";
+    }
+
+    // Records of planes that read the same rows share a unit while they share base tiles, so each
+    // tile is read once; with too few units for the cores, every record gets a unit of its own.
+    struct chunk {
+        std::vector<size_t>  recs;
+        std::vector<int64_t> src;
+    };
+
+    auto make_chunks = [&](bool join) {
+        std::vector<chunk>                                      chunks;
+        std::map<std::tuple<int64_t, int64_t, int64_t>, size_t> owner;  // (blk0, row0, base tile) -> chunk
+        for (size_t i = 0; i < recs.size(); i++) {
+            const ml_plane &     p = plan.planes[recs[i].run.plane];
+            std::vector<int64_t> merged;
+            size_t               at = chunks.size();
+            for (size_t k = 0; join && at == chunks.size() && k < recs[i].src.size(); k++) {
+                auto it = owner.find({p.blk0, p.row0, recs[i].src[k]});
+                if (it == owner.end()) {
+                    continue;
+                }
+                const chunk & ch = chunks[it->second];
+                merged.clear();
+                std::set_union(ch.src.begin(), ch.src.end(), recs[i].src.begin(), recs[i].src.end(),
+                               std::back_inserter(merged));
+                if ((int64_t) merged.size() <= ML_REMAP_MAX_SRC) {
+                    at = it->second;
+                }
+            }
+            if (at == chunks.size()) {
+                chunks.push_back({{i}, recs[i].src});
+            } else {
+                chunks[at].recs.push_back(i);
+                chunks[at].src = std::move(merged);
+            }
+            for (int64_t tile : recs[i].src) {
+                owner.try_emplace({p.blk0, p.row0, tile}, at);
+            }
+        }
+        return chunks;
+    };
+    std::vector<chunk> chunks = make_chunks(true);
+    if ((int64_t) chunks.size() * p0.nblk * rt_out < workers) {
+        chunks = make_chunks(false);
+    }
+
+    int64_t max_src = 0;
+    for (const chunk & ch : chunks) {
+        if ((int64_t) ch.src.size() > ML_REMAP_MAX_SRC) {
+            return "an output tile reads too many base tiles";
+        }
+        max_src = std::max(max_src, (int64_t) ch.src.size());
+    }
+    out.n_chunks        = (int64_t) chunks.size();
+    out.slots           = max_src + 1;
+    const uint32_t zero = (uint32_t) (max_src * 1024);
+
+    std::vector<uint32_t> & w = out.table;
+    w.assign(1 + chunks.size(), 0);
+    w[0] = (uint32_t) chunks.size();
+    for (size_t c = 0; c < chunks.size(); c++) {
+        const chunk &    ch = chunks[c];
+        const ml_plane & p  = plan.planes[recs[ch.recs[0]].run.plane];
+
+        auto slot_of = [&](int64_t tile) {
+            return (uint32_t) (std::lower_bound(ch.src.begin(), ch.src.end(), tile) - ch.src.begin());
+        };
+        uint32_t flags = 0;
+        for (size_t i : ch.recs) {
+            if (recs[i].run.page && plan.in.W % ML_TILE != 0 && recs[i].run.src_tile == ct_in - 1) {
+                flags |= ML_REMAP_ZERO_PAD_LANES;
+            }
+        }
+        w[1 + c] = (uint32_t) w.size();
+        w.insert(w.end(), {(uint32_t) p.blk0, (uint32_t) (p.row0 / ML_TILE), (uint32_t) ch.src.size(), flags,
+                           (uint32_t) ch.recs.size()});
+        for (int64_t tile : ch.src) {
+            w.push_back((uint32_t) tile);
+        }
+        for (size_t i : ch.recs) {
+            const ml_run &                run = recs[i].run;
+            const std::vector<uint32_t> & d   = dsts[run.plane];
+            w.push_back((run.page ? 0u : 1u << 31) | (uint32_t) d.size() << 16 | (uint32_t) run.out_tile);
+            w.insert(w.end(), d.begin(), d.end());
+            if (run.page) {
+                w.push_back(slot_of(run.src_tile));
+                continue;
+            }
+            const std::vector<int32_t> & lanes = plan.planes[run.plane].lanes;
+
+            auto source = [&](int64_t c) {
+                if (c >= plan.W_out || lanes[c] < 0) {
+                    return zero;
+                }
+                return slot_of(lanes[c] / ML_TILE) * 1024 + (uint32_t) ml_face_offset(0, lanes[c] % ML_TILE);
+            };
+            for (int64_t k = 0; k < ML_TILE / 2; k++) {
+                const int64_t c = run.out_tile * ML_TILE + 2 * k;
+                w.push_back(source(c) | source(c + 1) << 16);
+            }
+        }
+    }
+    w.resize((w.size() + ML_REMAP_PAGE_WORDS - 1) / ML_REMAP_PAGE_WORDS * ML_REMAP_PAGE_WORDS, 0);
+    if (w.size() > ML_REMAP_MAX_WORDS) {
+        return "lane table too large";
+    }
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint32_t v : w) {
+        h = (h ^ v) * 0x100000001b3ull;
+    }
+    out.hash = h;
+    return nullptr;
 }
 
 const char * ml_bin_broadcast(const int64_t * dst_ne, const int64_t * src1_ne, int g) {

@@ -2040,7 +2040,7 @@ int main(int argc, char ** argv)
         tests.push_back(std::move(tc));
     }
 
-    // An attention head split with heads that are not tile-aligned stays on the natural path
+    // An attention head split with heads that are not tile-aligned
     tests.push_back(make_exact_test([](ggml_context* ctx) {
         ggml_tensor* q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 320, 64, 1);
         return ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, q, 40, 8, 64, 1), 0, 2, 1, 3));
@@ -2134,6 +2134,107 @@ int main(int argc, char ** argv)
         };
         tests.push_back(std::move(tc));
     }
+
+    // Planned data movement moves bits, not values: leaves holding +-Inf, the largest bf16 and tiny
+    // normals come out bit for bit through every kind of lane move. Each leaf is overwritten after the
+    // random init, from a generator of its own.
+    auto with_specials = [](std::unique_ptr<test_case> tc) {
+        tc->after_init = [](ggml_context* ctx) {
+            std::mt19937 rng(7);
+            std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+            const float specials[] = {INFINITY, -INFINITY, 3.3895314e38f, -3.3895314e38f, 2.3509887e-38f, -2.3509887e-38f, 1.0f};
+            for (ggml_tensor* t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->op != GGML_OP_NONE || strncmp(t->name, "special", 7) != 0) {
+                    continue;
+                }
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = i % 5 == 0 ? specials[(i / 5) % 7] : u(rng);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            }
+            return true;
+        };
+        return tc;
+    };
+    auto special_leaf = [](ggml_context* ctx, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
+        ggml_tensor* t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne0, ne1, ne2, ne3);
+        ggml_set_name(t, "special");
+        return t;
+    };
+    tests.push_back(with_specials(make_exact_test([special_leaf](ggml_context* ctx) {
+        ggml_tensor* x = special_leaf(ctx, 128, 40, 3, 1);
+        return ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, x, 2, 64, 40, 3), 3, 0, 1, 2));
+    }, "CONT of the interleaved pair split of [128,40,3] with Inf and extreme values")));
+    tests.push_back(with_specials(make_exact_test([special_leaf](ggml_context* ctx) {
+        ggml_tensor* x = special_leaf(ctx, 1, 64, 40, 3);
+        return ggml_repeat(ctx, x, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 3));
+    }, "REPEAT [1,64,40,3] -> [2,64,40,3] with Inf and extreme values")));
+    tests.push_back(with_specials(make_exact_test([special_leaf](ggml_context* ctx) {
+        ggml_tensor* x = special_leaf(ctx, 2, 64, 40, 1);
+        return ggml_repeat(ctx, x, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 3));
+    }, "REPEAT [2,64,40,1] -> [2,64,40,3] with Inf and extreme values")));
+    tests.push_back(with_specials(make_exact_test([special_leaf](ggml_context* ctx) {
+        ggml_tensor* x = special_leaf(ctx, 120, 45, 2, 1);
+        return ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, x, 60, 2, 45, 2), 0, 3, 1, 2));
+    }, "CONT of the non-interleaved half split of [120,45,2] with Inf and extreme values")));
+    tests.push_back(with_specials(make_exact_test([special_leaf](ggml_context* ctx) {
+        ggml_tensor* x = special_leaf(ctx, 96, 40, 3, 1);
+        return ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, x, 3, 32, 40, 3), 1, 0, 2, 3));
+    }, "CONT of the stride-3 lane split of [96,40,3] with Inf and extreme values")));
+    tests.push_back(with_specials(make_exact_test([special_leaf](ggml_context* ctx) {
+        ggml_tensor* pe = special_leaf(ctx, 2, 2, 64, 97);
+        ggml_tensor* v = ggml_view_4d(ctx, pe, 2, 2, 40, 97, pe->nb[1], pe->nb[2], pe->nb[3], 12 * pe->nb[2]);
+        return ggml_cont(ctx, ggml_permute(ctx, v, 3, 0, 1, 2));
+    }, "CONT of PERMUTE(3,0,1,2) of lanes 48.. of a pe-like [2,2,64,97] leaf with Inf and extreme values")));
+
+    // A lane move out of rows 32.. of a base, and results with pad rows and pad lanes read by a
+    // matmul, which reduces over whole tiles
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 97);
+        ggml_tensor* rows = ggml_view_2d(ctx, x, 128, 65, x->nb[1], 32 * x->nb[1]);
+        return ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, rows, 2, 64, 65, 1), 3, 0, 1, 2));
+    }, "CONT of the interleaved pair split of rows 32..97 of [128,97]"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 120, 45, 2);
+        ggml_tensor* w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 60, 16);
+        ggml_tensor* c = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, x, 2, 60, 45, 2), 3, 0, 1, 2));
+        return ggml_mul_mat(ctx, w, c);
+    }, "MatMul K=60 of a leaf and the interleaved pair split of [120,45,2]", 1e-3));
+
+    // Attention head splits of many heads, whole tiles and not, all in one lane move
+    const std::array<int64_t, 3> head_splits[] = {{128, 24, 77}, {40, 24, 45}, {64, 33, 40}};
+    for (const auto & hs : head_splits) {
+        const int64_t d = hs[0], h = hs[1], L = hs[2];
+        tests.push_back(make_exact_test([=](ggml_context* ctx) {
+            ggml_tensor* q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d * h, L, 1);
+            return ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, q, d, h, L, 1), 0, 2, 1, 3));
+        }, "CONT of a head split of [" + std::to_string(d * h) + "," + std::to_string(L) + ",1] into " +
+           std::to_string(h) + " heads of " + std::to_string(d)));
+    }
+
+    // Lane moves with enough work to share one read of base tiles between several output tiles:
+    // stride-2 (even and odd built together) and stride-4 splits, and heads ending in a partial last
+    // lane tile, which is copied out whole with its pad lanes zeroed
+    tests.push_back(with_specials(make_exact_test([special_leaf](ggml_context* ctx) {
+        ggml_tensor* x = special_leaf(ctx, 128, 320, 24, 1);
+        return ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, x, 2, 64, 320, 24), 3, 0, 1, 2));
+    }, "CONT of the interleaved pair split of [128,320,24] with Inf and extreme values")));
+    tests.push_back(with_specials(make_exact_test([special_leaf](ggml_context* ctx) {
+        ggml_tensor* x = special_leaf(ctx, 128, 384, 24, 1);
+        return ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, x, 4, 32, 384, 24), 3, 0, 1, 2));
+    }, "CONT of the stride-4 lane split of [128,384,24] with Inf and extreme values")));
+    for (int64_t L : {77, 2080}) {
+        tests.push_back(with_specials(make_exact_test([special_leaf, L](ggml_context* ctx) {
+            ggml_tensor* q = special_leaf(ctx, 200, L, 1, 1);
+            return ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, q, 40, 5, L, 1), 0, 2, 1, 3));
+        }, "CONT of a head split of [200," + std::to_string(L) + ",1] into 5 heads of 40 with Inf and extreme values")));
+    }
+    // More planes than one lane move takes
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64 * 65, 40, 1);
+        return ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, q, 64, 65, 40, 1), 0, 2, 1, 3));
+    }, "CONT of a head split of [4160,40,1] into 65 heads of 64"));
 
     ///////////////// end of experiment code /////////////////
 

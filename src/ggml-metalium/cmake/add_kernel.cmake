@@ -36,6 +36,15 @@ function(register_kernels target kernel_names)
 
     # Generate the registration source file
     set(KERNEL_NAMES "${kernel_names}")
+    # Regenerate it when the list changes: make does not rerun a custom command whose command line changed
+    set(NAMES_FILE "${CMAKE_BINARY_DIR}/generated/metalium/__kernel_names.txt")
+    set(OLD_NAMES "")
+    if(EXISTS "${NAMES_FILE}")
+        file(READ "${NAMES_FILE}" OLD_NAMES)
+    endif()
+    if(NOT OLD_NAMES STREQUAL KERNEL_NAMES)
+        file(WRITE "${NAMES_FILE}" "${KERNEL_NAMES}")
+    endif()
     add_custom_command(
         OUTPUT "${OUTPUT}"
         COMMAND ${CMAKE_COMMAND} -E echo "Generating Metalium kernel registration source"
@@ -44,7 +53,7 @@ function(register_kernels target kernel_names)
                 "-DKERNEL_NAMES=${KERNEL_NAMES}"
                 -P ${CMAKE_CURRENT_LIST_DIR}/cmake/kernel_register.cmake
 
-        DEPENDS ${CMAKE_CURRENT_LIST_DIR}/cmake/kernel_register.cmake
+        DEPENDS ${CMAKE_CURRENT_LIST_DIR}/cmake/kernel_register.cmake "${NAMES_FILE}"
         COMMENT "Generating kernel registration source"
         VERBATIM
     )

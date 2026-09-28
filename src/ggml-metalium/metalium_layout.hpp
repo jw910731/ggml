@@ -85,6 +85,36 @@ std::vector<ml_run> ml_classify_runs(const ml_plan & plan);
 // CPU oracle: the plan applied to the base's elements in flat order
 std::vector<float> ml_apply_plan_host(const ml_plan & plan, const std::vector<float> & base);
 
+// A plan as a lane_remap program (lane_remap.hpp). A work unit (chunk, block n, output row tile rt)
+// reads the chunk's base lane tiles of one row tile into slots, then builds each of the chunk's
+// records, one output lane tile, and writes it to every plane it stands for (a plane and its
+// duplicates). The slot after the last one a chunk uses holds zeros.
+//
+// The table, in 32-bit words: [0] chunk count, [1 + c] word offset of chunk c. A chunk is
+//   base block of n = 0, base row tile of rt = 0, slot count S, flags, record count R,
+//   the S base lane tiles, then R records.
+// A record is
+//   gather << 31 | destination count D << 16 | output lane tile, the D destination planes, then
+//   either the slot to copy verbatim or, for a gather, 16 words: the halfword offsets of the row-0
+//   sources of output lanes 2k (low half) and 2k + 1 (high half) within the unit's slots.
+struct ml_remap {
+    std::vector<uint32_t> table;
+    uint64_t              hash     = 0;
+    int64_t               n_chunks = 0;
+    int64_t               slots    = 0;  // per unit, including the zero slot
+    int64_t               nblk     = 0;
+    int64_t               nrow     = 0;
+};
+
+// Chunk flag: zero the pad lanes of the base's last lane tile, which a verbatim copy writes out
+static constexpr uint32_t ML_REMAP_ZERO_PAD_LANES = 1;
+// Tables are whole pages of this many words, so their page size never recompiles the kernel
+static constexpr size_t   ML_REMAP_PAGE_WORDS     = 256;
+
+// Builds the lane_remap program of a plan for a device with `workers` data-movement cores.
+// Returns nullptr, or why the plan does not fit one.
+const char * ml_build_remap(const ml_plan & plan, int64_t workers, ml_remap & out);
+
 // Whether a binary op can take src1 folded like dst (g lowest dims as lanes): src1 may broadcast
 // row and outer dims, or all of its lane dims at once, but never part of a lane group.
 const char * ml_bin_broadcast(const int64_t * dst_ne, const int64_t * src1_ne, int g);

@@ -13,6 +13,7 @@ ggml_add_backend_library(ggml-metalium
     flux_rope.cpp
     graph_report.cpp
     metalium_layout.cpp
+    lane_remap.cpp
 )
 
 target_include_directories(ggml-metalium PRIVATE
@@ -76,6 +77,7 @@ if(GGML_METALIUM_EMBED_KERNELS)
             flux_rope_reader
             flux_rope_compute
             flux_rope_writer
+            lane_remap_mover
     )
     include(cmake/add_kernel.cmake)
     foreach(kernel IN ITEMS ${GGML_METALIUM_EMBED_KERNELS})
