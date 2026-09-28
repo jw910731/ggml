@@ -65,6 +65,8 @@
 #include <ttnn/operations/data_movement/transpose/transpose.hpp>
 #include <ttnn/operations/data_movement/permute/permute.hpp>
 #include <ttnn/operations/data_movement/repeat/repeat.hpp>
+#include <ttnn/operations/experimental/bcast_to/bcast_to.hpp>
+#include <ttnn/operations/data_movement/fill_pad/fill_pad.hpp>
 #include <ttnn/operations/data_movement/repeat_interleave/repeat_interleave.hpp>
 #include <ttnn/operations/data_movement/concat/concat.hpp>
 #include <ttnn/operations/copy/typecast/typecast.hpp>
@@ -694,13 +696,17 @@ static std::shared_ptr<ttnn::Tensor> realize_ggml_view_impl(const ggml_tensor* t
         return std::make_shared<ttnn::Tensor>(res);
     }
     if(op == GGML_OP_VIEW) {
+        // The parent realized below already applied every view under src0, so this
+        // needs the VIEW's own offset; view_offs is cumulative down to view_src.
+        size_t offset = 0;
+        memcpy(&offset, tensor->op_params, sizeof(offset));
 #ifdef GGML_METALIUM_TTPRM
         // A view that is really a reshape is metadata-only for TTNN, so ttprm's
         // gather would be strictly more expensive than what we already do. Offer
         // it only the views that currently cost a slice -- and usually a reshape
         // on one or both sides of it.
         if(!keep_block_float &&
-           !(tensor->view_offs == 0 && ggml_nelements(src0) == ggml_nelements(tensor))) {
+           !(offset == 0 && ggml_nelements(src0) == ggml_nelements(tensor))) {
             if(auto fused = ggml_ttprm::realize_view(tensor)) {
                 return fused;
             }
@@ -717,7 +723,6 @@ static std::shared_ptr<ttnn::Tensor> realize_ggml_view_impl(const ggml_tensor* t
         std::array dst_stride = std::to_array(tensor->nb);
         std::array src_size = std::to_array(src0->ne);
         std::array src_stride = std::to_array(src0->nb);
-        size_t offset = tensor->view_offs;
         // ggml_backend_metalium_buffer_context* bufctx = ((ggml_tensor_extra_metalium*)tensor->extra)->bufctx;
 
         // TODO: Generalize this to use permute instead of transpose
@@ -1964,15 +1969,37 @@ static void ggml_backend_metalium_repeat(ggml_backend_metalium_context * ctx, st
     auto tensor = realize_ggml_view(dst->src[0]);
     ttsl::SmallVector<uint32_t> repeats;
     repeats.resize(GGML_MAX_DIMS);
+    std::array<uint32_t, GGML_MAX_DIMS> dst_shape;
     int ndiff = 0;
+    bool broadcast_only = true;
+    bool repeats_tile_dim = false;
     for(int i = 0; i < GGML_MAX_DIMS; i++) {
         auto repeat = dst->ne[i] / src0->ne[i];
         repeats[GGML_MAX_DIMS - i - 1] = repeat;
+        dst_shape[GGML_MAX_DIMS - i - 1] = dst->ne[i];
         ndiff += (repeat != 1);
+        broadcast_only = broadcast_only && (repeat == 1 || src0->ne[i] == 1);
+        repeats_tile_dim = repeats_tile_dim || (repeat != 1 && i < 2);
     }
     if(ndiff == 0) {
         *dst_meta = {
             .tensor = std::make_shared<ttnn::Tensor>(*tensor),
+        };
+        return;
+    }
+
+    // ttnn::repeat can only repeat a tiled H or W axis through a row-major round trip with
+    // one stick per page. Repeating extent-1 axes is a broadcast, which broadcast_to does
+    // tile to tile. broadcast_to also copies the value into the tile padding, while the
+    // round trip re-tilizes with zero pads, and the custom mul_mat kernel sums the padded K
+    // tail unmasked -- so zero the padding again.
+    const bool float_dst = dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16;
+    if(broadcast_only && repeats_tile_dim && float_dst &&
+       tensor->dtype() == tt::tt_metal::DataType::BFLOAT16 && tensor->layout() == tt::tt_metal::Layout::TILE &&
+       tensor->logical_shape().rank() == GGML_MAX_DIMS && ggml_tt_tensors_shape_equal(src0, *tensor)) {
+        auto res = ttnn::experimental::broadcast_to(*tensor, ttnn::Shape(dst_shape), std::nullopt, std::nullopt);
+        *dst_meta = {
+            .tensor = std::make_shared<ttnn::Tensor>(ttnn::fill_implicit_tile_padding(res, 0.0f)),
         };
         return;
     }

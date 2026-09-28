@@ -352,6 +352,22 @@ static std::unique_ptr<test_case> make_test(const std::function<ggml_tensor* (gg
     return tc;
 }
 
+static double max_abs_diff(const float * a, const float * b, size_t n) {
+    double m = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        m = std::max(m, (double)std::fabs(a[i] - b[i]));
+    }
+    return m;
+}
+
+// For pure data movement: the CPU reference reads the same bf16 leaves back, so any
+// difference at all is a misplaced element.
+static std::unique_ptr<test_case> make_exact_test(const std::function<ggml_tensor* (ggml_context*)> & build_graph, std::string name) {
+    std::unique_ptr<test_case> tc = std::make_unique<test_case>(std::move(name), build_graph, max_abs_diff);
+    tc->max_err = 0.0f;
+    return tc;
+}
+
 static std::string type_name(ggml_type type)
 {
     return ggml_get_type_traits(type)->type_name;
@@ -527,6 +543,49 @@ static void add_apply_rope_full_path_tests(std::vector<std::unique_ptr<test_case
     make_full(128, 4,  64,   1, "apply_rope full path d128 h4 L64");
     make_full(128, 30, 256,  1, "apply_rope full path d128 h30 L256 (z-image heads)");
     make_full(128, 30, 1024, 1, "apply_rope full path d128 h30 L1024 (z-image scale)");
+}
+
+// Rope::apply_rope from upstream stable-diffusion.cpp (88411ef, rope.hpp:1070-1109), with
+// ggml_ext_torch_permute(0, 2, 3, 1) written as the ggml_permute(0, 3, 1, 2) it expands to.
+static ggml_tensor* upstream_apply_rope(ggml_context* ctx,
+                                        ggml_tensor* x,
+                                        ggml_tensor* pe,
+                                        bool rope_interleaved = true) {
+    // x: [N, L, n_head, d_head]
+    // pe: [L, d_head/2, 2, 2], [[cos, -sin], [sin, cos]]
+    int64_t d_head = x->ne[0];
+    int64_t n_head = x->ne[1];
+    int64_t L      = x->ne[2];
+    int64_t N      = x->ne[3];
+    x              = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));  // [N, n_head, L, d_head]
+    if (rope_interleaved) {
+        x = ggml_reshape_4d(ctx, x, 2, d_head / 2, L, n_head * N);  // [N * n_head, L, d_head/2, 2]
+        x = ggml_cont(ctx, ggml_permute(ctx, x, 3, 0, 1, 2));       // [2, N * n_head, L, d_head/2]
+    } else {
+        x = ggml_reshape_4d(ctx, x, d_head / 2, 2, L, n_head * N);  // [N * n_head, L, 2, d_head/2]
+        x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 3, 1, 2));       // [2, N * n_head, L, d_head/2]
+    }
+
+    int64_t offset = x->nb[2] * x->ne[2];
+    auto x_0       = ggml_view_3d(ctx, x, x->ne[0], x->ne[1], x->ne[2], x->nb[1], x->nb[2], offset * 0);  // [N * n_head, L, d_head/2]
+    auto x_1       = ggml_view_3d(ctx, x, x->ne[0], x->ne[1], x->ne[2], x->nb[1], x->nb[2], offset * 1);  // [N * n_head, L, d_head/2]
+    x_0            = ggml_reshape_4d(ctx, x_0, 1, x_0->ne[0], x_0->ne[1], x_0->ne[2]);                    // [N * n_head, L, d_head/2, 1]
+    x_1            = ggml_reshape_4d(ctx, x_1, 1, x_1->ne[0], x_1->ne[1], x_1->ne[2]);                    // [N * n_head, L, d_head/2, 1]
+    auto temp_x    = ggml_new_tensor_4d(ctx, x_0->type, 2, x_0->ne[1], x_0->ne[2], x_0->ne[3]);
+    x_0            = ggml_repeat(ctx, x_0, temp_x);  // [N * n_head, L, d_head/2, 2]
+    x_1            = ggml_repeat(ctx, x_1, temp_x);  // [N * n_head, L, d_head/2, 2]
+
+    pe        = ggml_cont(ctx, ggml_permute(ctx, pe, 3, 0, 1, 2));  // [2, L, d_head/2, 2]
+    offset    = pe->nb[2] * pe->ne[2];
+    auto pe_0 = ggml_view_3d(ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], pe->nb[1], pe->nb[2], offset * 0);  // [L, d_head/2, 2]
+    auto pe_1 = ggml_view_3d(ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], pe->nb[1], pe->nb[2], offset * 1);  // [L, d_head/2, 2]
+
+    auto x_out = ggml_add_inplace(ctx, ggml_mul(ctx, x_0, pe_0), ggml_mul(ctx, x_1, pe_1));  // [N * n_head, L, d_head/2, 2]
+    if (!rope_interleaved) {
+        x_out = ggml_cont(ctx, ggml_permute(ctx, x_out, 1, 0, 2, 3));  // [N * n_head, L, x, d_head/2]
+    }
+    x_out = ggml_reshape_3d(ctx, x_out, d_head, L, n_head * N);  // [N*n_head, L, d_head]
+    return x_out;
 }
 
 // The real diffusion weights are BF16 (z-image-turbo-BF16.gguf); every Linear is
@@ -1592,6 +1651,109 @@ int main(int argc, char ** argv)
                                       qkv->nb[0] * 128, qkv->nb[1], 0);
         return ggml_rms_norm(ctx, v, 1e-6f);
     }, "RMSNorm over a QKV-split view (2-level row map)"));
+
+    // REPEAT of extent-1 axes that include ne0/ne1, which ttnn::repeat can only do through a
+    // row-major round trip, so the backend broadcasts it instead.
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 64, 40, 3);
+        return ggml_repeat(ctx, x, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 3));
+    }, "REPEAT leaf [1,64,40,3] -> [2,64,40,3]"));
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 64, 1, 3);
+        return ggml_repeat(ctx, x, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 3));
+    }, "REPEAT leaf [1,64,1,3] -> [2,64,40,3] (ne0 and ne2)"));
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 40, 3);
+        ggml_tensor* c = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, x, 2, 64, 40, 3), 3, 0, 1, 2));
+        ggml_tensor* v = ggml_view_3d(ctx, c, c->ne[0], c->ne[1], c->ne[2], c->nb[1], c->nb[2], c->nb[2] * c->ne[2]);
+        ggml_tensor* r = ggml_reshape_4d(ctx, v, 1, v->ne[0], v->ne[1], v->ne[2]);
+        return ggml_repeat(ctx, r, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 3));
+    }, "REPEAT of the upstream apply_rope plane-1 chain [1,64,40,3] -> [2,64,40,3]"));
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* m = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 40, 1, 1, 1);
+        return ggml_repeat(ctx, m, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 40, 33, 1, 1));
+    }, "REPEAT mask-like [40,1,1,1] -> [40,33,1,1]"));
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 50);
+        return ggml_repeat(ctx, m, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 50));
+    }, "REPEAT [1,50] -> [64,50]"));
+
+    // A VIEW whose src[0] is itself a view with an offset: view_offs is cumulative, the
+    // realized parent has the inner offset applied already. The first shape is one ttprm
+    // gathers, the second (widths not 16-aligned) goes through the backend's slice path.
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 256);
+        ggml_tensor* v1 = ggml_view_2d(ctx, x, 64, 128, x->nb[1], x->nb[1] * 16);
+        ggml_tensor* r  = ggml_reshape_2d(ctx, v1, 128, 64);
+        ggml_tensor* v2 = ggml_view_2d(ctx, r, 128, 16, r->nb[1], r->nb[1] * 8);
+        return ggml_cont(ctx, v2);
+    }, "CONT of VIEW(RESHAPE(VIEW)) with two non-zero offsets"));
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 20, 96);
+        ggml_tensor* v1 = ggml_view_2d(ctx, x, 20, 64, x->nb[1], x->nb[1] * 8);
+        ggml_tensor* r  = ggml_reshape_2d(ctx, v1, 40, 32);
+        ggml_tensor* v2 = ggml_view_2d(ctx, r, 40, 8, r->nb[1], r->nb[1] * 4);
+        return ggml_cont(ctx, v2);
+    }, "CONT of VIEW(RESHAPE(VIEW)) with two non-zero offsets (slice path)"));
+
+    for (bool interleaved : {true, false}) {
+        tests.push_back(make_test([interleaved](ggml_context* ctx) {
+            ggml_tensor* x  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 4, 40, 1);
+            ggml_tensor* pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, 64, 40);
+            return upstream_apply_rope(ctx, x, pe, interleaved);
+        }, std::string("upstream apply_rope D128 H4 L40 N1 ") + (interleaved ? "interleaved" : "non-interleaved"), 1e-3));
+    }
+
+    // Broadcast shapes the REPEAT fast path takes through its other kernels (SCALAR, and an
+    // outer batch broadcast next to a tile dim), an F16 result, and shapes it must leave to
+    // ttnn::repeat.
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 40, 3);
+        return ggml_repeat(ctx, x, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 33, 20, 40, 3));
+    }, "REPEAT scalar broadcast [1,1,40,3] -> [33,20,40,3]"));
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 64, 40, 1);
+        return ggml_repeat(ctx, x, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 3));
+    }, "REPEAT [1,64,40,1] -> [2,64,40,3] (ne0 and ne3)"));
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 1, 50);
+        return ggml_repeat(ctx, m, ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 64, 50));
+    }, "REPEAT F16 [1,50] -> [64,50]"));
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 64);
+        return ggml_repeat(ctx, x, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 64));
+    }, "REPEAT [2,64] -> [4,64] (tiling, not a broadcast)"));
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 3, 2);
+        return ggml_repeat(ctx, x, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 3, 4));
+    }, "REPEAT [1,3,2] -> [4,3,4] (broadcast ne0, tile ne2)"));
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, 1, 1, 2);
+        return ggml_repeat(ctx, x, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, 1, 3, 2));
+    }, "REPEAT [64,1,1,2] -> [64,1,3,2] (ne2 only)"));
+
+    // The custom matmul kernel reduces over the whole last K tile, so a REPEAT result must
+    // keep zero tile padding like the row-major path it replaced: exp() leaves exp(0) = 1 in
+    // the other operand's pads. Batched, so these take that kernel even with
+    // GGML_METALIUM_CACHE_MM_TRANSPOSE set.
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 48, 32, 2);
+        ggml_tensor* c = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 64, 2);
+        ggml_tensor* b = ggml_repeat(ctx, c, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 48, 64, 2));
+        return ggml_mul_mat(ctx, ggml_exp(ctx, a), b);
+    }, "MatMul K=48 of exp(a) and a lane-broadcast REPEAT (pad lanes)"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 48, 32, 2);
+        ggml_tensor* c = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, 2);
+        ggml_tensor* b = ggml_repeat(ctx, c, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 48, 64, 2));
+        return ggml_mul_mat(ctx, ggml_exp(ctx, a), b);
+    }, "MatMul K=48 of exp(a) and a scalar-broadcast REPEAT (pad lanes)"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 48, 32, 2);
+        ggml_tensor* c = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 40, 1, 2);
+        ggml_tensor* r = ggml_repeat(ctx, c, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 40, 48, 2));
+        return ggml_mul_mat(ctx, ggml_exp(ctx, a), ggml_cont(ctx, ggml_transpose(ctx, r)));
+    }, "MatMul K=48 of exp(a) and a transposed row-broadcast REPEAT (pad rows)"));
 
     ///////////////// end of experiment code /////////////////
 

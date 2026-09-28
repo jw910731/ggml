@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <numeric>
 #include <exception>
 #include <map>
@@ -178,10 +179,11 @@ bool fold_affine(const ggml_tensor* t, chain_t& c) {
 }
 
 // Walk down src[0] through VIEW/RESHAPE to the first materialized tensor,
-// accumulating view_offs. This deliberately mirrors realize_ggml_view_impl():
-// the parent comes from src[0], NOT view_src, because ggml collapses view_src
-// past in-place ops while this backend writes in-place results into a fresh
-// tensor that IS src[0].
+// accumulating each VIEW's own op_params offset. This deliberately mirrors
+// realize_ggml_view_impl(): the parent comes from src[0], NOT view_src, because ggml
+// collapses view_src past in-place ops while this backend writes in-place results into
+// a fresh tensor that IS src[0]. view_offs is cumulative down to view_src, so summing it
+// would count every inner view's offset again.
 bool resolve_base(const ggml_tensor* t, chain_t& c) {
     int64_t off_bytes = 0;
     const ggml_tensor* cur = t;
@@ -195,7 +197,11 @@ bool resolve_base(const ggml_tensor* t, chain_t& c) {
             c.offset = off_bytes / (int64_t)ggml_type_size(t->type);
             return true;
         }
-        if (cur->op == GGML_OP_VIEW) off_bytes += (int64_t)cur->view_offs;
+        if (cur->op == GGML_OP_VIEW) {
+            size_t local = 0;
+            memcpy(&local, cur->op_params, sizeof(local));
+            off_bytes += (int64_t)local;
+        }
         if (cur->src[0] == nullptr) return false;
         cur = cur->src[0];
         // Element sizes must agree for the byte offset to fold into one element count.
@@ -425,6 +431,13 @@ out_plan plan_output(const ggml_tensor* node, const ttnn::Tensor& like, const ch
     return p;
 }
 
+// ttprm refuses a presented width that is not a whole number of faces only when the op plans,
+// after plan_output() has allocated the bound result -- and those narrow views are the ones
+// whose result tile-pads 16-32x. ttprm::prelower() would catch every refusal up front, but it
+// walks every face-row of the view, so calling it here as well doubles ttprm's host time.
+bool face_aligned_width(const chain_t& c) { return c.cols % ttprm::FACE == 0; }
+constexpr const char* k_sub_face_width = "logical width not 16-aligned (sub-face pad boundary)";
+
 // Give the result the shape the backend expects. A bound output already has it. An
 // unbound (rank-2) result only needs the leading ones put back, which leaves the last
 // two dims -- and therefore the physical tiling -- untouched, so ttnn::reshape is a
@@ -496,6 +509,10 @@ std::shared_ptr<ttnn::Tensor> realize_view(const ggml_tensor* node) {
     chain_t c;
     auto v = view_for(node, c, site);
     if (!v) return nullptr;
+    if (!face_aligned_width(c)) {
+        reject(site, std::string("input view lowers to REJECT: ") + k_sub_face_width, c);
+        return nullptr;
+    }
 
     try {
         out_plan op = plan_output(node, *c.tt, site);
@@ -538,6 +555,11 @@ std::shared_ptr<ttnn::Tensor> bin_op(const ggml_tensor* dst, ggml_op op) {
     if (!va) return nullptr;
     auto vb = view_for(src1, cb, site);
     if (!vb) return nullptr;
+    if (!face_aligned_width(ca) || !face_aligned_width(cb)) {
+        reject(site, std::string(face_aligned_width(ca) ? "b" : "a") + " view REJECT: " + k_sub_face_width +
+                     "  b=" + describe(cb), ca);
+        return nullptr;
+    }
 
     try {
         out_plan op_out = plan_output(dst, *ca.tt, site);
@@ -575,6 +597,10 @@ std::shared_ptr<ttnn::Tensor> norm(const ggml_tensor* dst, bool rms, float eps) 
     chain_t c;
     auto v = view_for(src0, c, site);
     if (!v) return nullptr;
+    if (!face_aligned_width(c)) {
+        reject(site, std::string("x view REJECT: ") + k_sub_face_width, c);
+        return nullptr;
+    }
 
     try {
         out_plan op_out = plan_output(dst, *c.tt, site);
