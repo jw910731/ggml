@@ -3951,12 +3951,11 @@ static void ggml_metalium_release_use(const ggml_tensor * tensor, const ggml_cgr
     }
 }
 
-// The device tensor realize() reads for t. Unlike find_mem_holder, a VIEW goes through src[0]: its view_src skips
+// The device tensor realize() reads for t. As in find_mem_holder, a VIEW goes through src[0]: its view_src skips
 // past in-place results to their stale base.
 static const ttnn::Tensor * ggml_metalium_report_source(const struct ggml_tensor * t) {
     for (;;) {
-        if ((t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
-             t->op == GGML_OP_TRANSPOSE) && t->src[0] != nullptr) {
+        if (ggml_metalium_is_view_op(t) && t->src[0] != nullptr) {
             t = t->src[0];
             continue;
         }
@@ -4487,44 +4486,65 @@ static ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(ggml_backend
     return &buffer_type_map[device_id];
 }
 
-// Follow view_src chain to find the root tensor that owns device memory
 // Find the node that actually owns the device memory backing `t`.
 //
-// This MUST mirror realize_ggml_view's data-location rule exactly, so that the
-// tensor we free is precisely the one whose extra->tensor realize() would read:
-//   - VIEW                       -> follow view_src
-//   - RESHAPE / PERMUTE / TRANSPOSE -> follow src[0] (the IMMEDIATE parent)
+// For every holder that has an op, this MUST mirror realize_ggml_view's data-location rule, so that
+// the tensor we free is precisely the one whose extra->tensor realize() would read:
+//   - VIEW / RESHAPE / PERMUTE / TRANSPOSE -> follow src[0] (the IMMEDIATE parent)
+//   - a leaf view (op NONE) under a VIEW -> follow view_src, which realize() reads
+//     when the leaf holds no tensor of its own
 //   - any other op (real or in-place) -> owns its extra->tensor; stop here.
 //
 // The src[0] distinction is the subtle part. In-place ops (ggml_add_inplace /
 // ggml_mul_inplace / ...) have view_src set just like a view, but they DO
 // execute and store their result in their OWN extra->tensor. ggml collapses
-// view_src to the ultimate base, so a reshape of an in-place result points its
-// view_src PAST the in-place node to the aliased source. Following view_src
+// view_src to the ultimate base, so a view or reshape of an in-place result points
+// its view_src PAST the in-place node to the aliased source. Following view_src
 // there would skip the in-place node, leaving its device buffer with no free
 // target -> it leaks for the whole graph (this is what made z-image OOM after
-// accumulating every layer's RoPE/RMSNorm in-place results). Following src[0]
-// for reshape/permute/transpose lands on the in-place node, matching realize().
+// accumulating every layer's RoPE/RMSNorm in-place results, and what kept every
+// in-place RoPE result that Qwen-Image 2.1's prefix cache slices). Following src[0]
+// lands on the in-place node, matching realize().
 //
 // What makes freeing each holder independently SAFE: this backend never does
 // true device-side in-place compute. Every "inplace" handler allocates a fresh
 // make_shared device tensor and overwrites dst_meta (see e.g. ggml_backend_
 // metalium_bin_op and _scale), so no two nodes share a device buffer and each
-// holder's lifetime is exactly [produced .. last_use]. The lone exception is
-// GGML_OP_SET (KV-cache, ggml_backend_metalium_set) which really does alias dst
-// to the cache base, but that base has op==GGML_OP_NONE and lives outside the compute
-// buffer, which the free loop's op-NONE guard excludes, so it is never freed here.
+// holder's lifetime is exactly [produced .. last_use]. The exceptions are CPY, SET
+// and SET_ROWS, which hand their result to their destination operand too. A view of
+// such a node names the node as the holder, so freeing it drops only the node's
+// reference; the destination keeps the tensor for as long as its own holder lives.
 static struct ggml_tensor * find_mem_holder(struct ggml_tensor * t) {
+    bool under_view = false;
     for (;;) {
-        if (t->op == GGML_OP_VIEW && t->view_src) {
-            t = t->view_src;
-        } else if ((t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
-                    t->op == GGML_OP_TRANSPOSE) && t->src[0]) {
+        if (ggml_metalium_is_view_op(t) && t->src[0]) {
+            under_view = under_view || t->op == GGML_OP_VIEW;
             t = t->src[0];
+        } else if (under_view && t->op == GGML_OP_NONE && t->view_src) {
+            t = t->view_src;
         } else {
             return t;
         }
     }
+}
+
+// Returns false for a parent whose bytes are not exactly node's
+static bool ggml_metalium_alias_inplace_parent(struct ggml_tensor * node, struct ggml_tensor * parent) {
+    const auto * node_meta = (ggml_tensor_extra_metalium *)node->extra;
+    auto * meta = (ggml_tensor_extra_metalium *)parent->extra;
+    // A parent this node overwrites only part of keeps its tensor; so do weights (LoRA merges in place)
+    if (parent == node || meta == nullptr || parent->buffer != node->buffer ||
+        ggml_backend_buffer_get_usage(parent->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+        ggml_metalium_family(parent) != ggml_metalium_family(node) ||
+        parent->data != node->data || !ggml_are_same_layout(parent, node)) {
+        return false;
+    }
+    if (meta->tensor != node_meta->tensor) {
+        meta->tensor = node_meta->tensor;
+        meta->fold = node_meta->fold;
+        ggml_metalium_release_range(parent, false, true);
+    }
+    return true;
 }
 
 // An in-place result is a fresh device tensor here, while ggml says the parents' bytes are now the result's.
@@ -4533,24 +4553,16 @@ static void ggml_metalium_alias_inplace_parents(struct ggml_tensor * node) {
     if (node->view_src == nullptr || node->buffer == nullptr) {
         return;
     }
-    const auto * node_meta = (ggml_tensor_extra_metalium *)node->extra;
-    const auto & result = node_meta->tensor;
     struct ggml_tensor * parent = node->src[0];
     while (parent != nullptr) {
         parent = find_mem_holder(parent);
-        auto * meta = (ggml_tensor_extra_metalium *)parent->extra;
-        // A parent this node overwrites only part of keeps its tensor; so do weights (LoRA merges in place)
-        if (parent == node || meta == nullptr || parent->buffer != node->buffer ||
-            ggml_backend_buffer_get_usage(parent->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
-            ggml_metalium_family(parent) != ggml_metalium_family(node) ||
-            parent->data != node->data || !ggml_are_same_layout(parent, node)) {
-            return;
+        if (!ggml_metalium_alias_inplace_parent(node, parent)) {
+            break;
         }
-        meta->tensor = result;
-        meta->fold = node_meta->fold;
-        ggml_metalium_release_range(parent, false, true);
         parent = parent->view_src != nullptr ? parent->src[0] : nullptr;
     }
+    // The walk leaves CPY and SET_ROWS through the operand they read, not the storage root they write
+    ggml_metalium_alias_inplace_parent(node, node->view_src);
 }
 
 // The device tensors a node reads. Views have no device tensor of their own, so report the one realize() reads.
@@ -4595,10 +4607,12 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
             }
         }
     }
-    // Also mark the final graph output so we never free it
-    if (whole_graph && cgraph->n_nodes > 0) {
-        struct ggml_tensor * final_node = cgraph->nodes[cgraph->n_nodes - 1];
-        last_use[find_mem_holder(final_node)] = cgraph->n_nodes; // beyond last index
+    // Never free what the caller may read back: the final node and, as in ggml-alloc, every output
+    for (int i = 0; whole_graph && i < cgraph->n_nodes; i++) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        if (i == cgraph->n_nodes - 1 || (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            last_use[find_mem_holder(node)] = cgraph->n_nodes; // beyond last index
+        }
     }
 
     ggml_metalium_graph_info graph_info;
@@ -4886,8 +4900,13 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
                 auto * root_meta = (ggml_tensor_extra_metalium*)root->extra;
                 if (root_meta && root_meta->tensor) {
                     long refcount = root_meta->tensor.use_count();
-                    // CPY hands its result to its destination too; that is not a leak
-                    if (refcount > 1 && root_meta->tensor != meta->tensor) {
+                    // CPY, SET and SET_ROWS hand their result to their destination too; that is not a leak
+                    const bool handed = root_meta->tensor == meta->tensor ||
+                                        std::ranges::any_of(root->src, [&](const ggml_tensor * d) {
+                                            return d != nullptr && d->extra != nullptr &&
+                                                   ((ggml_tensor_extra_metalium *)d->extra)->tensor == root_meta->tensor;
+                                        });
+                    if (refcount > 1 && !handed) {
                         fmt::println(stderr, "[LEAK] op={} name={} src[{}] root_op={} root_name={} refcount={}",
                             ggml_op_name(node->op), node->name, s,
                             ggml_op_name(root->op), root->name, refcount);

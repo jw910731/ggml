@@ -186,6 +186,8 @@ struct test_case
     std::function<ggml_tensor* (ggml_context*)> build_graph;
     // Runs once the tensors hold data; returning false fails the test
     std::function<bool(ggml_context*)> after_init;
+    // Runs once the graph is computed and compared, before its buffer is freed; returning false fails the test
+    std::function<bool(ggml_context*)> after_compute;
     // Computes and compares one node at a time, so the backend runs every node as a partial graph
     bool per_node = false;
 
@@ -344,11 +346,16 @@ struct test_case
             printf("compare failed ");
         }
 
+        const bool after_ok = !after_compute || after_compute(ctx);
+        if (!after_ok) {
+            printf("after_compute check failed ");
+        }
+
         ggml_backend_buffer_free(buf);
 
         ggml_free(ctx);
 
-        if (ud.ok && cmp_ok) {
+        if (ud.ok && cmp_ok && after_ok) {
             printf("\033[1;32mOK\033[0m\n");
             return TestResult::OK;
         }
@@ -2038,6 +2045,95 @@ int main(int argc, char ** argv)
         ggml_tensor* q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 320, 64, 1);
         return ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, q, 40, 8, 64, 1), 0, 2, 1, 3));
     }, "CONT of a head split of [320,64,1] into 8 heads of 40"));
+
+    // ggml points a VIEW's view_src past an in-place node to the stale base, but the in-place node holds the
+    // data here, so a whole graph must free it once the VIEW's consumer ran. initialize_tensors() uploads the
+    // 4 MiB MUL result as well, so freeing both intermediates leaves that much more DRAM free than before,
+    // give or take the kernel binaries a cold program cache allocates.
+    {
+        auto dram_free = [](ggml_context* ctx) {
+            ggml_backend_buffer_t buffer = ggml_get_tensor(ctx, "inplace_base")->buffer;
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer)), &free, &total);
+            return (int64_t)free;
+        };
+        auto free_before = std::make_shared<int64_t>(0);
+        auto tc = make_test([](ggml_context* ctx) {
+            ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 512, 16);
+            ggml_tensor* b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 512, 16);
+            ggml_set_name(a, "inplace_base");
+            ggml_tensor* s = ggml_reshape_4d(ctx, ggml_add_inplace(ctx, ggml_mul(ctx, a, b), a), 256, 512, 16, 1);
+            return ggml_cont(ctx, ggml_view_4d(ctx, s, 256, 8, 16, 1, s->nb[1], s->nb[2], s->nb[3], 8 * s->nb[1]));
+        }, "CONT of rows 8..16 of RESHAPE of add_inplace of a MUL frees the ADD result");
+        tc->after_init = [=](ggml_context* ctx) {
+            *free_before = dram_free(ctx);
+            return true;
+        };
+        tc->after_compute = [=](ggml_context* ctx) {
+            return dram_free(ctx) - *free_before > 2 * 1024 * 1024;
+        };
+        tests.push_back(std::move(tc));
+    }
+
+    // The same in-place result read through a VIEW before and after a direct consumer. Freeing it at the
+    // direct consumer would leave the second VIEW reading the base from before the SCALE.
+    for (bool per_node : {false, true}) {
+        auto tc = make_exact_test([](ggml_context* ctx) {
+            ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 32);
+            ggml_tensor* x = ggml_scale_inplace(ctx, a, 2.0f);
+            ggml_tensor* v = ggml_view_2d(ctx, x, 64, 8, x->nb[1], 8 * x->nb[1]);
+            ggml_tensor* early = ggml_concat(ctx, ggml_cont(ctx, v), ggml_cont(ctx, x), 1);
+            return ggml_concat(ctx, early, ggml_cont(ctx, v), 1);
+        }, std::string("CONT of rows 8..16 of scale_inplace before and after a CONT of all of it") +
+           (per_node ? " (per node)" : ""));
+        tc->per_node = per_node;
+        tests.push_back(std::move(tc));
+    }
+
+    // In a compute buffer, one node at a time: an in-place op on a VIEW of a CPY result rewrites both the CPY
+    // result and its destination, and the next node reads both.
+    {
+        auto tc = make_exact_test([](ggml_context* ctx) {
+            ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 32);
+            ggml_tensor* dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 32);
+            ggml_set_name(dst, "cpy_dst");
+            ggml_tensor* c = ggml_cpy(ctx, a, dst);
+            ggml_tensor* n = ggml_scale_inplace(ctx, ggml_view_2d(ctx, c, 64, 32, c->nb[1], 0), 2.0f);
+            return ggml_concat(ctx, n, ggml_concat(ctx, dst, c, 1), 1);
+        }, "CONCAT of a CPY destination and its result after scale_inplace of a VIEW of it (per node, compute buffer)");
+        tc->per_node = true;
+        tc->after_init = [](ggml_context* ctx) {
+            ggml_backend_buffer_set_usage(ggml_get_tensor(ctx, "cpy_dst")->buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            return true;
+        };
+        tests.push_back(std::move(tc));
+    }
+
+    // A graph output must stay readable after the graph, even when a later node consumes it
+    {
+        auto tc = make_test([](ggml_context* ctx) {
+            ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 32, 1);
+            ggml_tensor* b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 32, 1);
+            ggml_set_name(a, "output_a");
+            ggml_set_name(b, "output_b");
+            ggml_tensor* s = ggml_reshape_3d(ctx, ggml_add_inplace(ctx, ggml_mul(ctx, a, b), a), 64, 8, 4);
+            ggml_tensor* v = ggml_view_2d(ctx, s, 64, 8, s->nb[1], s->nb[2]);
+            ggml_set_name(v, "output_view");
+            ggml_set_output(v);
+            return ggml_scale(ctx, ggml_cont(ctx, v), 0.5f);
+        }, "CONT of rows 8..16 of RESHAPE of add_inplace of a MUL, with those rows a graph output");
+        tc->after_compute = [](ggml_context* ctx) {
+            std::vector<float> a = tensor_to_float(ggml_get_tensor(ctx, "output_a"));
+            std::vector<float> b = tensor_to_float(ggml_get_tensor(ctx, "output_b"));
+            std::vector<float> v = tensor_to_float(ggml_get_tensor(ctx, "output_view"));
+            std::vector<float> expected(v.size());
+            for (size_t i = 0; i < expected.size(); i++) {
+                expected[i] = a[8 * 64 + i] * b[8 * 64 + i] + a[8 * 64 + i];
+            }
+            return nmse(expected.data(), v.data(), v.size()) < 1e-4;
+        };
+        tests.push_back(std::move(tc));
+    }
 
     ///////////////// end of experiment code /////////////////
 
