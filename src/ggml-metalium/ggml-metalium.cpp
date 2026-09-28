@@ -33,6 +33,9 @@
 #include "umd/device/types/arch.hpp"
 #include "umd/device/types/cluster_descriptor_types.hpp"
 #include <string.h>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -91,6 +94,7 @@
 #include "tmp_soft_max.hpp"
 #include "flux_rope.hpp"
 #include "graph_report.hpp"
+#include "metalium_layout.hpp"
 
 extern void metalium_register_all_kernel();
 
@@ -98,6 +102,8 @@ struct ggml_backend_metalium_context {
     ttnn::IDevice* device = nullptr;
     int device_id = 0;
     std::string name;
+    // 0/1 lane selection matrices of the planned-op executor, keyed by {base row width, lanes...}
+    std::map<std::vector<int32_t>, std::shared_ptr<ttnn::Tensor>> lane_selectors;
 };
 
 struct ggml_backend_metalium_device_context {
@@ -276,7 +282,7 @@ struct ggml_backend_metalium_debug_flags {
     bool disable_program_cache = false;     // Disables the program cache
     bool experimental_ops = true;          // Enable experimental ops that is known to cause trouble
     bool memory_profile = false;
-    int fold = 0;                           // GGML_METALIUM_FOLD: 0 off, 1 auto, 2 fold any tensor it shrinks
+    int fold = 1;                           // GGML_METALIUM_FOLD: 0 off, 1 auto (default), 2 fold any tensor it shrinks
     bool fold_stats = false;                // Print the fold histogram at exit
 };
 
@@ -302,7 +308,7 @@ static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
         .memory_profile = parse_env("GGML_METALIUM_MEMORY_PROFILE"),
         .fold = []() {
             const char* val = std::getenv("GGML_METALIUM_FOLD");
-            return val != nullptr ? std::clamp(atoi(val), 0, 2) : 0;
+            return val != nullptr ? std::clamp(atoi(val), 0, 2) : 1;
         }(),
         .fold_stats = parse_env("GGML_METALIUM_FOLD_STATS")
     };
@@ -393,13 +399,13 @@ static bool ggml_metalium_layout_ok(const ggml_tensor * t, const ggml_tensor_ext
     return ggml_tt_tensors_shape_equal(t, *meta->tensor);
 }
 
-// GGML_METALIUM_FOLD_STATS=1 prints how often tensors were uploaded folded, read folded, and
-// restored to their ggml shape, when the process exits.
+// GGML_METALIUM_FOLD_STATS=1 prints how often tensors were uploaded folded, read folded, restored
+// to their ggml shape, and computed by planned ops or declined by them (and why), at exit.
 struct ggml_metalium_fold_stats {
     std::mutex mu;
     std::map<std::string, size_t> counts;
 
-    void bump(const char * what, const ggml_tensor * t, int g) {
+    void bump(std::string_view what, const ggml_tensor * t, int g) {
         if (!g_debug_flags.fold_stats) {
             return;
         }
@@ -530,6 +536,40 @@ static bool is_ggml_type_supported_by_metalium(ggml_type ggtype, tt::ARCH arch) 
     return ggml2tt_type_internal(ggtype, arch) != tt::tt_metal::DataType::INVALID;
 }
 
+// GGML_FP32_TO_BF16 (round to nearest even, NaNs made quiet), which ggml's CPU backend only has as
+// a scalar loop; uploads of float inputs spend most of their time here.
+static void ggml_metalium_fp32_to_bf16(const float * src, uint16_t * dst, size_t n)
+{
+    size_t i = 0;
+#if defined(__SSE2__)
+    const __m128i abs_mask = _mm_set1_epi32(0x7fffffff);
+    const __m128i inf      = _mm_set1_epi32(0x7f800000);
+    const __m128i one      = _mm_set1_epi32(1);
+    const __m128i half     = _mm_set1_epi32(0x7fff);
+    const __m128i quiet    = _mm_set1_epi32(64);
+    const __m128i bias     = _mm_set1_epi32(0x8000);
+    for (; i + 8 <= n; i += 8) {
+        __m128i halves[2];
+        for (int k = 0; k < 2; k++) {
+            const __m128i u       = _mm_loadu_si128((const __m128i *)(src + i + 4 * k));
+            const __m128i hi      = _mm_srli_epi32(u, 16);
+            const __m128i rounded = _mm_srli_epi32(_mm_add_epi32(u, _mm_add_epi32(half, _mm_and_si128(hi, one))), 16);
+            const __m128i nan     = _mm_cmpgt_epi32(_mm_and_si128(u, abs_mask), inf);
+            const __m128i bits = _mm_or_si128(_mm_and_si128(nan, _mm_or_si128(hi, quiet)), _mm_andnot_si128(nan, rounded));
+            // The only 32 -> 16 bit pack in SSE2 saturates signed values
+            halves[k] = _mm_sub_epi32(bits, bias);
+        }
+        const __m128i packed = _mm_packs_epi32(halves[0], halves[1]);
+        _mm_storeu_si128((__m128i *)(dst + i), _mm_xor_si128(packed, _mm_set1_epi16((short)0x8000)));
+    }
+#endif
+    for (; i < n; i++) {
+        uint32_t u;
+        memcpy(&u, src + i, sizeof(u));
+        dst[i] = (u & 0x7fffffff) > 0x7f800000 ? (uint16_t)((u >> 16) | 64) : (uint16_t)((u + 0x7fff + ((u >> 16) & 1)) >> 16);
+    }
+}
+
 template <typename SrcType, typename DstType>
 static tt::tt_metal::HostBuffer host_data_to_tt_host_buffer(const SrcType* src, size_t size) {
     // Converts GGML floating point (FP32, FP16, BF16) to TT floating point (FP32, BF16)
@@ -585,9 +625,8 @@ static tt::tt_metal::HostBuffer host_data_to_tt_host_buffer(const SrcType* src, 
     }
     // special case for BFP16 (much faster then TTNN's implementation)
     else if constexpr(std::is_same_v<Src, float> && std::is_same_v<Dst, bfloat16>) {
-        const auto* trait = ggml_get_type_traits_cpu(GGML_TYPE_BF16);
-        assert(trait != nullptr);
-        trait->from_float(src, vec, size);
+        static_assert(sizeof(bfloat16) == sizeof(uint16_t));
+        ggml_metalium_fp32_to_bf16(src, reinterpret_cast<uint16_t*>(vec), size);
     }
     else {
         for(size_t i = 0; i < size; i++) {
@@ -824,32 +863,39 @@ struct ggml_metalium_flat {
     bool folded;  // tensor is the storage of a folded tensor
 };
 
-// A tensor whose row-major element order is t's ggml order, like realize_ggml_view(t), but a
-// folded tensor under t is handed back as is instead of being restored.
-static ggml_metalium_flat ggml_metalium_realize_flat(const ggml_tensor * t, bool keep_block_float = false)
+// Whether view op t only relabels src[0]'s elements, keeping their order
+static bool ggml_metalium_keeps_order(const ggml_tensor * t)
 {
     const ggml_tensor * src0 = t->src[0];
-    bool same_order = false;
     if(t->op == GGML_OP_RESHAPE) {
-        same_order = true;
+        return true;
     }
-    else if(t->op == GGML_OP_VIEW) {
+    if(t->op == GGML_OP_VIEW) {
         size_t offset = 0;
         memcpy(&offset, t->op_params, sizeof(offset));
-        same_order = offset == 0 && ggml_nelements(src0) == ggml_nelements(t);
+        return offset == 0 && ggml_nelements(src0) == ggml_nelements(t);
     }
-    else if(t->op == GGML_OP_PERMUTE) {
+    if(t->op == GGML_OP_PERMUTE) {
         // Moving only extent-1 axes keeps the element order
         int32_t axes[GGML_MAX_DIMS];
         memcpy(axes, t->op_params, sizeof(axes));
-        same_order = true;
+        bool same_order = true;
         for(int i = 0; i < GGML_MAX_DIMS; i++) {
             for(int j = i + 1; j < GGML_MAX_DIMS; j++) {
                 same_order = same_order && (src0->ne[i] == 1 || src0->ne[j] == 1 || axes[i] < axes[j]);
             }
         }
+        return same_order;
     }
-    if(same_order) {
+    return false;
+}
+
+// A tensor whose row-major element order is t's ggml order, like realize_ggml_view(t), but a
+// folded tensor under t is handed back as is instead of being restored.
+static ggml_metalium_flat ggml_metalium_realize_flat(const ggml_tensor * t, bool keep_block_float = false)
+{
+    const ggml_tensor * src0 = t->src[0];
+    if(ggml_metalium_keeps_order(t)) {
         auto res = ggml_metalium_realize_flat(src0, keep_block_float);
         return {res.tensor, ggml_metalium_fold_of(t, res.tensor->logical_shape()), res.folded};
     }
@@ -1350,8 +1396,371 @@ static bool ggml_metalium_aliases_source(const ttnn::Tensor & res, const ggml_te
     return false;
 }
 
+///////////////////////////////////////////////////////////////////////////////////////////////////////
+// Planned data movement: CONT/DUP/CPY, REPEAT and binary operands that read only row-local lanes of
+// one materialized base (see metalium_layout.hpp) run as block/row slices plus a lane selection,
+// straight into the layout their consumers want, instead of reshaping through tile padding.
+///////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// The whole graph being computed, for decisions that depend on how a tensor is consumed
+struct ggml_metalium_graph_info {
+    std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>> consumers;
+    std::unordered_map<const ggml_tensor *, int> want_fold;
+};
+
+static thread_local ggml_metalium_graph_info * g_metalium_graph = nullptr;
+
+struct ggml_metalium_graph_scope {
+    explicit ggml_metalium_graph_scope(ggml_metalium_graph_info * info) { g_metalium_graph = info; }
+    ~ggml_metalium_graph_scope() { g_metalium_graph = nullptr; }
+};
+
+// Whether every consumer of u reads t's folded storage without restoring it. Views are followed to
+// their consumers; a VIEW or RESHAPE that only relabels a folded tensor into its own natural shape
+// is free (realize() reads those through ggml_metalium_relabel_parent, but a PERMUTE restores).
+static bool ggml_metalium_fold_friendly(const ggml_tensor * u, const std::array<uint32_t, GGML_MAX_DIMS> & storage,
+                                        bool same_order, int depth)
+{
+    auto it = g_metalium_graph->consumers.find(u);
+    if (it == g_metalium_graph->consumers.end()) {
+        return true;
+    }
+    for (const ggml_tensor * c : it->second) {
+        switch (c->op) {
+            case GGML_OP_ADD:
+            case GGML_OP_SUB:
+            case GGML_OP_MUL:
+            case GGML_OP_REPEAT:
+            case GGML_OP_CONT:
+            case GGML_OP_DUP:
+            case GGML_OP_CPY:
+                continue;
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE: {
+                const bool keeps = same_order && ggml_metalium_keeps_order(c);
+                if (keeps && c->op != GGML_OP_PERMUTE && ggml_tt_shape_equal(c, ttnn::Shape(storage))) {
+                    continue;
+                }
+                if (depth >= 16 || !ggml_metalium_fold_friendly(c, storage, keeps, depth + 1)) {
+                    return false;
+                }
+                continue;
+            }
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
+// The fold a computed tensor should be stored in, 0 for its natural shape. Only whole graphs know
+// every consumer; GGML_METALIUM_FOLD=2 folds regardless.
+static int ggml_metalium_want_fold(const ggml_tensor * t)
+{
+    const int g = ggml_metalium_choose_fold(t);
+    if (g == 0 || g_debug_flags.fold == 2) {
+        return g;
+    }
+    if (g_metalium_graph == nullptr) {
+        return 0;
+    }
+    auto [it, fresh] = g_metalium_graph->want_fold.try_emplace(t, 0);
+    if (fresh) {
+        it->second = ggml_metalium_fold_friendly(t, ggml_metalium_fold_shape(t, g), true, 0) ? g : 0;
+    }
+    return it->second;
+}
+
+struct ggml_metalium_planned {
+    const ttnn::Tensor * base = nullptr;
+    ml_plan plan;
+};
+
+// Plans acc's node as the TT shape ml_coarsen(ne, g_out). Returns nullptr, or why it cannot.
+static const char * ggml_metalium_plan(const ml_access & acc, int g_out, ggml_metalium_planned & out)
+{
+    const auto * meta = (const ggml_tensor_extra_metalium *)acc.base->extra;
+    if (meta == nullptr || meta->tensor == nullptr) {
+        return "base is not materialized";
+    }
+    const ttnn::Tensor & base = *meta->tensor;
+    if (meta->is_flat_kernel || meta->is_pretransposed || !ggml_metalium_layout_ok(acc.base, meta) ||
+        base.storage_type() != ttnn::StorageType::DEVICE || base.layout() != tt::tt_metal::Layout::TILE ||
+        base.dtype() != tt::tt_metal::DataType::BFLOAT16) {
+        return "base is not a bf16 tile tensor";
+    }
+    const ttnn::Shape & shape = base.logical_shape();
+    std::array<int64_t, 8> dims{};
+    if (shape.rank() > dims.size()) {
+        return "base rank";
+    }
+    for (size_t i = 0; i < shape.rank(); i++) {
+        dims[i] = shape[i];
+    }
+    out.base = &base;
+    if (const char * why = ml_plan_row_local(acc, g_out, ml_grid_of(dims.data(), (int)shape.rank()), out.plan)) {
+        return why;
+    }
+    // Every plane but a duplicate is a slice (and a matmul) of its own. Measured on attention head
+    // splits, plans of more planes lose to the natural reshape + permute unless the tensor is large.
+    if (std::ranges::count_if(out.plan.planes, [](const ml_plane & p) { return p.dup_of < 0; }) > 4) {
+        return "more than 4 planes";
+    }
+    // The selection matmul reduces over whole K tiles, so the base's pad lanes must not exist
+    for (const ml_plane & p : out.plan.planes) {
+        if (p.dup_of < 0 && p.op == ml_lane_op::gather &&
+            (out.plan.in.W % tt::constants::TILE_WIDTH != 0 || out.plan.in.W * out.plan.W_out > (1 << 20))) {
+            return "lane gather needs tile-aligned base rows";
+        }
+    }
+    return nullptr;
+}
+
+// A bf16 [1, 1, W_in, W_out] matrix with a 1 at (lanes[c], c): x @ S picks lane lanes[c] of each row
+static const ttnn::Tensor & ggml_metalium_lane_selector(ggml_backend_metalium_context * ctx, int64_t W_in,
+                                                        const std::vector<int32_t> & lanes, ttnn::MeshDevice * device)
+{
+    std::vector<int32_t> key;
+    key.reserve(lanes.size() + 1);
+    key.push_back((int32_t)W_in);
+    key.insert(key.end(), lanes.begin(), lanes.end());
+    auto it = ctx->lane_selectors.find(key);
+    if (it == ctx->lane_selectors.end()) {
+        const size_t W_out = lanes.size();
+        std::vector<float> host((size_t)W_in * W_out, 0.0f);
+        for (size_t c = 0; c < W_out; c++) {
+            if (lanes[c] >= 0) {
+                host[(size_t)lanes[c] * W_out + c] = 1.0f;
+            }
+        }
+        ttnn::Tensor sel(host_data_to_tt_host_buffer<float, bfloat16>(host.data(), host.size()),
+                         ttnn::Shape({1, 1, (uint32_t)W_in, (uint32_t)W_out}), tt::tt_metal::DataType::BFLOAT16,
+                         tt::tt_metal::Layout::ROW_MAJOR);
+        sel = ttnn::tilize_with_zero_padding(sel.to_device(device), std::nullopt, tt::tt_metal::DataType::BFLOAT16);
+        it = ctx->lane_selectors.emplace(std::move(key), std::make_shared<ttnn::Tensor>(std::move(sel))).first;
+    }
+    return *it->second;
+}
+
+// Runs a plan with stock ttnn ops: a slice per plane, a selection matmul for lanes that are not a
+// tile-aligned window, then a concat of the planes. The matmul copies finite values exactly; Inf,
+// NaN, -0 and subnormals follow the FPU's rules rather than IEEE's (on Blackhole 0 x Inf is 0, so
+// an Inf passes through). With `copy`, a plan that moves nothing still returns a tensor of its own
+// rather than the base.
+static std::shared_ptr<ttnn::Tensor> ggml_metalium_execute_plan_stock(ggml_backend_metalium_context * ctx,
+                                                                      const ggml_metalium_planned & planned, bool copy)
+{
+    const ml_plan & plan = planned.plan;
+    const ml_grid & in = plan.in;
+    const auto u32 = [](int64_t v) { return (uint32_t)v; };
+    // make_compute_kernel_config drops to HiFi2 under GGML_METALIUM_LOW_FIDELITY, which would round
+    // the selected values; bf16 x 1 accumulated in fp32 is exact at HiFi4.
+    const ttnn::DeviceComputeKernelConfig exact_cfg = ttnn::WormholeComputeKernelConfig{
+        .math_fidelity = MathFidelity::HiFi4, .math_approx_mode = false, .fp32_dest_acc_en = true, .packer_l1_acc = false};
+
+    const ttnn::Tensor flat = ttnn::reshape(*planned.base, ttnn::Shape({1, u32(in.blocks), u32(in.R), u32(in.W)}));
+    std::vector<ttnn::Tensor> pieces;
+    for (const ml_plane & p : plan.planes) {
+        if (p.dup_of >= 0) {
+            ttnn::Tensor dup = pieces[p.dup_of];
+            pieces.push_back(std::move(dup));
+            continue;
+        }
+        const bool window = p.op == ml_lane_op::window;
+        const int64_t c0 = window ? p.lanes[0] : 0;
+        const int64_t w = window ? plan.W_out : in.W;
+        ttnn::Tensor piece = flat;
+        if (p.blk0 != 0 || p.nblk != in.blocks || p.row0 != 0 || p.nrow != in.R || w != in.W) {
+            const std::array<uint32_t, GGML_MAX_DIMS> begins = {0, u32(p.blk0), u32(p.row0), u32(c0)};
+            const std::array<uint32_t, GGML_MAX_DIMS> ends = {1, u32(p.blk0 + p.nblk), u32(p.row0 + p.nrow), u32(c0 + w)};
+            const std::array<uint32_t, GGML_MAX_DIMS> step = {1, 1, 1, 1};
+            piece = ttnn::slice(flat, begins, ends, step, std::nullopt, std::nullopt, 0.0f);
+        }
+        if (p.op == ml_lane_op::gather) {
+            const ttnn::Tensor & sel = ggml_metalium_lane_selector(ctx, in.W, p.lanes, piece.device());
+            piece = ttnn::reshape(piece, ttnn::Shape({u32(p.nblk), 1, u32(p.nrow), u32(in.W)}));
+            piece = ttnn::operations::matmul::matmul(piece, sel, false, false, std::nullopt, std::nullopt,
+                                                     std::nullopt, std::nullopt, exact_cfg);
+            piece = ttnn::reshape(piece, ttnn::Shape({1, u32(p.nblk), u32(p.nrow), u32(plan.W_out)}));
+        }
+        pieces.push_back(std::move(piece));
+    }
+    ttnn::Tensor res = pieces.size() == 1 ? pieces[0] : ttnn::concat(pieces, 1);
+    std::array<uint32_t, GGML_MAX_DIMS> out;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        out[i] = u32(plan.out_shape[i]);
+    }
+    res = ttnn::reshape(res, ttnn::Shape(out));
+    if (copy && plan.identity()) {
+        // Stored results must not alias the base, whose lifetime ends with its own last use
+        res = ttnn::typecast(res, res.dtype());
+    }
+    return std::make_shared<ttnn::Tensor>(std::move(res));
+}
+
+static void ggml_metalium_plan_declined(const char * site, const char * why, const ggml_tensor * t, int g)
+{
+    if (g_debug_flags.fold_stats) {
+        g_fold_stats.bump(fmt::format("{} decline: {}", site, why), t, g);
+    }
+}
+
+// Copies whose base is folded, or whose chain touches a tensor that tile padding dominates, are
+// planned. Anything else keeps the existing path (TransposeHC, ttprm gathers, reshape + permute
+// head splits), which is cheap when no padding-dominated tensor gets materialized.
+static bool ggml_metalium_copy_is_expensive(const ggml_tensor * dst, const ggml_tensor * base)
+{
+    const auto * meta = (const ggml_tensor_extra_metalium *)base->extra;
+    if ((meta != nullptr && meta->fold != 0) || ggml_metalium_choose_fold(dst) != 0 ||
+        ggml_metalium_choose_fold(base) != 0) {
+        return true;
+    }
+    for (const ggml_tensor * t = dst->src[0]; t != base; t = t->src[0]) {
+        if (ggml_metalium_choose_fold(t) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_metalium_is_float(const ggml_tensor * t)
+{
+    return t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16;
+}
+
+// CONT/DUP, or CPY into a plain tensor, planned into the layout its consumers want
+static bool ggml_metalium_try_planned_copy(ggml_backend_metalium_context * ctx, ggml_tensor * dst)
+{
+    const ggml_tensor * src0 = dst->src[0];
+    ml_access acc;
+    if (g_debug_flags.fold == 0 || !ggml_metalium_is_float(dst) || !ggml_metalium_is_float(src0) ||
+        ml_resolve_chain(src0, acc) != nullptr || !ggml_metalium_copy_is_expensive(dst, acc.base)) {
+        return false;
+    }
+    const char * site = ggml_op_name(dst->op);
+    if (!ggml_are_same_shape(src0, dst)) {
+        ggml_metalium_plan_declined(site, "copy changes the shape", dst, 0);
+        return false;
+    }
+    // A CPY writes a tensor that may outlive the graph; keep it natural
+    const int g_want = dst->op == GGML_OP_CPY ? 0 : ggml_metalium_want_fold(dst);
+    ggml_metalium_planned planned;
+    int g = g_want;
+    const char * why = g != 0 ? ggml_metalium_plan(acc, g, planned) : nullptr;
+    if (g == 0 || why != nullptr) {
+        g = 0;
+        why = ggml_metalium_plan(acc, 1, planned);
+    }
+    if (why != nullptr) {
+        ggml_metalium_plan_declined(site, why, dst, g_want);
+        return false;
+    }
+    auto res = ggml_metalium_execute_plan_stock(ctx, planned, /*copy=*/true);
+    if (dst->op == GGML_OP_CPY) {
+        *(ggml_tensor_extra_metalium *)dst->src[1]->extra = {
+            .tensor = res,
+        };
+    }
+    *(ggml_tensor_extra_metalium *)dst->extra = {
+        .tensor = std::move(res),
+        .fold = (uint8_t)g,
+    };
+    if (g_debug_flags.fold_stats) {
+        g_fold_stats.bump(fmt::format("{} plan", site), dst, g);
+    }
+    return true;
+}
+
+// REPEAT of a chain whose broadcast dims are lanes of the folded result
+static bool ggml_metalium_try_planned_repeat(ggml_backend_metalium_context * ctx, ggml_tensor * dst)
+{
+    if (g_debug_flags.fold == 0) {
+        return false;
+    }
+    const int g = ggml_metalium_want_fold(dst);
+    if (g == 0 || !ggml_metalium_is_float(dst->src[0])) {
+        return false;
+    }
+    ml_access acc;
+    ggml_metalium_planned planned;
+    const char * why = ml_resolve_repeat(dst, acc);
+    if (why == nullptr) {
+        why = ggml_metalium_plan(acc, g, planned);
+    }
+    if (why != nullptr) {
+        ggml_metalium_plan_declined("REPEAT", why, dst, g);
+        return false;
+    }
+    *(ggml_tensor_extra_metalium *)dst->extra = {
+        .tensor = ggml_metalium_execute_plan_stock(ctx, planned, /*copy=*/true),
+        .fold = (uint8_t)g,
+    };
+    g_fold_stats.bump("REPEAT plan", dst, g);
+    return true;
+}
+
+// ADD/SUB/MUL on folded storage: both operands are read in dst's fold, which ttnn broadcasts over
+// outer dims, rows, or whole lane groups. DIV is not folded: pad lanes would divide 0 by 0.
+static bool ggml_metalium_try_folded_bin_op(ggml_backend_metalium_context * ctx, ggml_tensor * dst, ggml_op op)
+{
+    if (g_debug_flags.fold == 0 || (op != GGML_OP_ADD && op != GGML_OP_SUB && op != GGML_OP_MUL)) {
+        return false;
+    }
+    const int g = ggml_metalium_choose_fold(dst);
+    if (g == 0) {
+        return false;
+    }
+    const ggml_tensor * src[2] = {dst->src[0], dst->src[1]};
+    ml_access acc[2];
+    const char * why[2];
+    bool folded_operand = false;
+    for (int i = 0; i < 2; i++) {
+        why[i] = ggml_metalium_is_float(src[i]) ? ml_resolve_chain(src[i], acc[i]) : "operand is not float";
+        const auto * meta = why[i] == nullptr ? (const ggml_tensor_extra_metalium *)acc[i].base->extra : nullptr;
+        folded_operand = folded_operand || (meta != nullptr && meta->fold != 0);
+    }
+    if (!folded_operand && ggml_metalium_want_fold(dst) == 0) {
+        return false;
+    }
+    const char * reason = !ggml_are_same_shape(src[0], dst) ? "src0 is broadcast" : ml_bin_broadcast(dst->ne, src[1]->ne, g);
+    ggml_metalium_planned planned[2];
+    for (int i = 0; i < 2 && reason == nullptr; i++) {
+        reason = why[i] != nullptr ? why[i] : ggml_metalium_plan(acc[i], g, planned[i]);
+    }
+    if (reason != nullptr) {
+        ggml_metalium_plan_declined(ggml_op_name(op), reason, dst, g);
+        return false;
+    }
+    auto a = ggml_metalium_execute_plan_stock(ctx, planned[0], /*copy=*/false);
+    auto b = ggml_metalium_execute_plan_stock(ctx, planned[1], /*copy=*/false);
+    ttnn::Tensor res;
+    switch (op) {
+        case GGML_OP_ADD:
+            res = ttnn::add(*a, *b);
+            break;
+        case GGML_OP_SUB:
+            res = ttnn::subtract(*a, *b);
+            break;
+        default:
+            res = ttnn::multiply(*a, *b);
+            break;
+    }
+    *(ggml_tensor_extra_metalium *)dst->extra = {
+        .tensor = std::make_shared<ttnn::Tensor>(std::move(res)),
+        .fold = (uint8_t)g,
+    };
+    if (g_debug_flags.fold_stats) {
+        g_fold_stats.bump(fmt::format("{} folded", ggml_op_name(op)), dst, g);
+    }
+    return true;
+}
+
 static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
-    GGML_UNUSED(ctx);
+    if(ggml_metalium_try_planned_copy(ctx, dst)) {
+        return;
+    }
     // Don't need sanity check since the copy is lazy
     // GGML_METALIUM_OP_SANITY_CHECK(dst);
     // GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
@@ -1483,11 +1892,14 @@ static void ggml_backend_metalium_bin_op(ggml_backend_metalium_context * ctx, st
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
-    GGML_UNUSED(ctx);
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
+
+    if(ggml_metalium_try_folded_bin_op(ctx, dst, op)) {
+        return;
+    }
 
 #ifdef GGML_METALIUM_TTPRM
     // realize(src0) + realize(src1) + ttnn::<op> is three dispatches and two
@@ -2174,7 +2586,10 @@ static void ggml_backend_metalium_repeat(ggml_backend_metalium_context * ctx, st
 {
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
-    GGML_UNUSED(ctx);
+
+    if(ggml_metalium_try_planned_repeat(ctx, dst)) {
+        return;
+    }
 
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
     ggml_tensor* src0 = dst->src[0];
@@ -4186,6 +4601,16 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
         last_use[find_mem_holder(final_node)] = cgraph->n_nodes; // beyond last index
     }
 
+    ggml_metalium_graph_info graph_info;
+    for (int i = 0; whole_graph && g_debug_flags.fold != 0 && i < cgraph->n_nodes; i++) {
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (cgraph->nodes[i]->src[s]) {
+                graph_info.consumers[cgraph->nodes[i]->src[s]].push_back(cgraph->nodes[i]);
+            }
+        }
+    }
+    ggml_metalium_graph_scope graph_scope(whole_graph ? &graph_info : nullptr);
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
 
@@ -4740,6 +5165,7 @@ static ggml_backend_t internal_backend_metalium_init(ggml_backend_metalium_devic
         /* device            = */ device,
         /* device_id         = */ device_id,
         /* name              = */ dev_ctx->name,
+        /* lane_selectors    = */ {},
     };
 
     ggml_backend_t backend = new ggml_backend {

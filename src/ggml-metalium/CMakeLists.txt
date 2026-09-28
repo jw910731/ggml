@@ -12,6 +12,7 @@ ggml_add_backend_library(ggml-metalium
     tmp_soft_max.cpp
     flux_rope.cpp
     graph_report.cpp
+    metalium_layout.cpp
 )
 
 target_include_directories(ggml-metalium PRIVATE

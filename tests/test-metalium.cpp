@@ -186,6 +186,8 @@ struct test_case
     std::function<ggml_tensor* (ggml_context*)> build_graph;
     // Runs once the tensors hold data; returning false fails the test
     std::function<bool(ggml_context*)> after_init;
+    // Computes and compares one node at a time, so the backend runs every node as a partial graph
+    bool per_node = false;
 
     static const int sentinel_size = 1024;
     std::vector<ggml_tensor *> sentinels;
@@ -335,7 +337,8 @@ struct test_case
             GGML_UNUSED(index);
         };
 
-        const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud, &out, 1);
+        const bool cmp_ok = per_node ? ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud, nullptr, 0)
+                                     : ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud, &out, 1);
 
         if (!cmp_ok) {
             printf("compare failed ");
@@ -1844,6 +1847,197 @@ int main(int argc, char ** argv)
         };
         tests.push_back(std::move(tc));
     }
+
+    // Row-local data movement planned under GGML_METALIUM_FOLD: the upstream RoPE composite's plane
+    // de-interleave, lane-duplicating REPEATs of a plane, and binary ops on folded storage.
+    const std::array<int64_t, 3> c2_shapes[] = {{128, 40, 3}, {64, 33, 1}, {120, 77, 2}};
+    for (const auto & shape : c2_shapes) {
+        const int64_t D = shape[0], L = shape[1], B = shape[2];
+        const std::string dims = "[" + std::to_string(D) + "," + std::to_string(L) + "," + std::to_string(B) + "]";
+        tests.push_back(make_exact_test([=](ggml_context* ctx) {
+            ggml_tensor* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, L, B);
+            return ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, x, 2, D / 2, L, B), 3, 0, 1, 2));
+        }, "CONT of the interleaved pair split of " + dims));
+        tests.push_back(make_exact_test([=](ggml_context* ctx) {
+            ggml_tensor* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, L, B);
+            return ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, x, D / 2, 2, L, B), 0, 3, 1, 2));
+        }, "CONT of the non-interleaved half split of " + dims));
+    }
+    for (int plane : {0, 1}) {
+        tests.push_back(make_exact_test([plane](ggml_context* ctx) {
+            ggml_tensor* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 33, 2);
+            ggml_tensor* c = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, x, 2, 32, 33, 2), 3, 0, 1, 2));
+            ggml_tensor* v = ggml_view_3d(ctx, c, c->ne[0], c->ne[1], c->ne[2], c->nb[1], c->nb[2], c->nb[2] * c->ne[2] * plane);
+            ggml_tensor* r = ggml_reshape_4d(ctx, v, 1, v->ne[0], v->ne[1], v->ne[2]);
+            return ggml_repeat(ctx, r, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 32, 33, 2));
+        }, "REPEAT [1,32,33,2] -> [2,32,33,2] of plane " + std::to_string(plane) + " of a CONT"));
+    }
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, 1, 40, 3);
+        return ggml_repeat(ctx, x, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, 2, 40, 3));
+    }, "REPEAT [64,1,40,3] -> [64,2,40,3]"));
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 1);
+        return ggml_repeat(ctx, x, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 3));
+    }, "REPEAT [2,64,40,1] -> [2,64,40,3]"));
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 3);
+        return ggml_repeat(ctx, x, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 4, 64, 40, 3));
+    }, "REPEAT [2,64,40,3] -> [4,64,40,3] (lane tiling)"));
+
+    // Binary ops on folded operands. src1 may broadcast outer dims or whole lane groups only; the
+    // lane broadcasts and DIV must take the natural path.
+    const std::pair<ggml_op, const char *> folded_ops[] = {{GGML_OP_MUL, "MUL"}, {GGML_OP_ADD, "ADD"}, {GGML_OP_SUB, "SUB"}};
+    for (const auto & [op, name] : folded_ops) {
+        tests.push_back(make_test([op = op](ggml_context* ctx) {
+            ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 3);
+            ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 1);
+            return op == GGML_OP_MUL ? ggml_mul(ctx, a, b) : op == GGML_OP_ADD ? ggml_add(ctx, a, b) : ggml_sub(ctx, a, b);
+        }, std::string(name) + " [2,64,40,3] by [2,64,40,1]"));
+    }
+    const std::array<int64_t, 4> lane_broadcasts[] = {{1, 64, 40, 3}, {2, 1, 40, 3}};
+    for (const auto & bne : lane_broadcasts) {
+        tests.push_back(make_test([bne](ggml_context* ctx) {
+            ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 3);
+            ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, bne[0], bne[1], bne[2], bne[3]);
+            return ggml_mul(ctx, a, b);
+        }, "MUL [2,64,40,3] by [" + std::to_string(bne[0]) + "," + std::to_string(bne[1]) + ",40,3] (lane broadcast)"));
+    }
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 3);
+        ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 1);
+        return ggml_div(ctx, a, ggml_exp(ctx, b));
+    }, "DIV [2,64,40,3] by EXP of [2,64,40,1]", 1e-3));
+
+    // A pe-like leaf, folded at upload: a restore, the upstream permute, and row ranges of it
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, 64, 97);
+        return ggml_scale(ctx, pe, 2.0f);
+    }, "SCALE of a pe-like [2,2,64,97] leaf"));
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, 64, 97);
+        return ggml_cont(ctx, ggml_permute(ctx, pe, 3, 0, 1, 2));
+    }, "CONT of PERMUTE(3,0,1,2) of a pe-like [2,2,64,97] leaf"));
+    for (int64_t row0 : {0, 13}) {
+        tests.push_back(make_exact_test([row0](ggml_context* ctx) {
+            ggml_tensor* pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, 64, 97);
+            const int64_t n = row0 == 0 ? 32 : 97 - row0;
+            return ggml_cont(ctx, ggml_view_4d(ctx, pe, 2, 2, 64, n, pe->nb[1], pe->nb[2], pe->nb[3], pe->nb[3] * row0));
+        }, "CONT of rows " + std::to_string(row0) + ".. of a pe-like [2,2,64,97] leaf"));
+    }
+
+    // Folded results read by ops that know nothing of folds
+    auto folded_mul = [](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 3);
+        ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 1);
+        return ggml_mul(ctx, a, b);
+    };
+    tests.push_back(make_test([folded_mul](ggml_context* ctx) {
+        return ggml_soft_max(ctx, folded_mul(ctx));
+    }, "SOFT_MAX of a folded MUL result", 1e-3));
+    tests.push_back(make_test([folded_mul](ggml_context* ctx) {
+        return ggml_sum_rows(ctx, ggml_reshape_2d(ctx, folded_mul(ctx), 2, 64 * 40 * 3));
+    }, "SUM_ROWS of RESHAPE_2D of a folded MUL result", 1e-3));
+    tests.push_back(make_test([folded_mul](ggml_context* ctx) {
+        ggml_tensor* c = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 3);
+        return ggml_concat(ctx, folded_mul(ctx), c, 2);
+    }, "CONCAT on dim 2 of a folded MUL result and a leaf"));
+    tests.push_back(make_test([folded_mul](ggml_context* ctx) {
+        ggml_tensor* w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 16);
+        return ggml_mul_mat(ctx, w, folded_mul(ctx));
+    }, "MatMul K=2 of a leaf and a folded MUL result", 1e-3));
+    tests.push_back(make_test([folded_mul](ggml_context* ctx) {
+        ggml_tensor* w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 16);
+        return ggml_mul_mat(ctx, w, ggml_reshape_3d(ctx, folded_mul(ctx), 128, 40, 3));
+    }, "MatMul K=128 of a leaf and RESHAPE_3D of a folded MUL result", 1e-3));
+
+    // Upstream apply_rope end to end, whole graph and one node at a time
+    const std::array<int64_t, 4> rope_shapes[] = {{128, 3, 40, 1}, {128, 24, 77, 1}, {64, 4, 33, 2}, {120, 2, 45, 1}};
+    for (bool per_node : {false, true}) {
+        for (const auto & shape : rope_shapes) {
+            for (bool interleaved : {true, false}) {
+                const int64_t D = shape[0], H = shape[1], L = shape[2], N = shape[3];
+                const std::string name = "upstream apply_rope D" + std::to_string(D) + " H" + std::to_string(H) + " L" +
+                                         std::to_string(L) + " N" + std::to_string(N) +
+                                         (interleaved ? " interleaved" : " non-interleaved");
+                auto rope = [=](ggml_context* ctx) {
+                    ggml_tensor* x  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, H, L, N);
+                    ggml_tensor* pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, D / 2, L);
+                    return upstream_apply_rope(ctx, x, pe, interleaved);
+                };
+                std::unique_ptr<test_case> variants[] = {
+                    make_test(rope, name, 1e-3),
+                    make_test([rope](ggml_context* ctx) { return ggml_scale(ctx, rope(ctx), 0.5f); }, "SCALE of " + name, 1e-3),
+                    make_test([rope](ggml_context* ctx) {
+                        ggml_tensor* out = rope(ctx);
+                        return ggml_cont(ctx, ggml_view_3d(ctx, out, out->ne[0], out->ne[1] - 9, out->ne[2], out->nb[1],
+                                                           out->nb[2], out->nb[1] * 9));
+                    }, "CONT of rows 9.. of " + name, 1e-3),
+                };
+                for (auto & tc : variants) {
+                    if (per_node) {
+                        tc->per_node = true;
+                        tc->name += " (per node)";
+                    }
+                    tests.push_back(std::move(tc));
+                }
+            }
+        }
+    }
+    for (bool interleaved : {true, false}) {
+        tests.push_back(make_test([interleaved](ggml_context* ctx) {
+            ggml_tensor* q  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 3, 40, 1);
+            ggml_tensor* k  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 3, 40, 1);
+            ggml_tensor* pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, 64, 40);
+            return ggml_concat(ctx, upstream_apply_rope(ctx, q, pe, interleaved), upstream_apply_rope(ctx, k, pe, interleaved), 2);
+        }, std::string("upstream apply_rope of q and k sharing one pe, ") + (interleaved ? "interleaved" : "non-interleaved"), 1e-3));
+    }
+
+    // An in-place ADD of folded leaves, read through a VIEW of whole row tiles
+    for (bool per_node : {false, true}) {
+        auto tc = make_test([](ggml_context* ctx) {
+            ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 3);
+            ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 64, 40, 3);
+            ggml_tensor* c = ggml_add_inplace(ctx, a, b);
+            return ggml_cont(ctx, ggml_view_4d(ctx, c, 2, 64, 32, 3, c->nb[1], c->nb[2], c->nb[3], 0));
+        }, std::string("CONT of rows 0..32 of add_inplace of folded leaves") + (per_node ? " (per node)" : ""));
+        tc->per_node = per_node;
+        tests.push_back(std::move(tc));
+    }
+
+    // Planned DUP and CPY into new tensors. A CPY result is never folded, and one that only relabels
+    // a folded result must be a copy of its own.
+    auto pair_split = [](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 33, 2);
+        return ggml_permute(ctx, ggml_reshape_4d(ctx, x, 2, 32, 33, 2), 3, 0, 1, 2);
+    };
+    tests.push_back(make_exact_test([pair_split](ggml_context* ctx) {
+        return ggml_dup(ctx, pair_split(ctx));
+    }, "DUP of the interleaved pair split of [64,33,2]"));
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (bool per_node : {false, true}) {
+            auto tc = make_exact_test([pair_split, type](ggml_context* ctx) {
+                ggml_tensor* v = pair_split(ctx);
+                return ggml_cpy(ctx, v, ggml_new_tensor(ctx, type, GGML_MAX_DIMS, v->ne));
+            }, "CPY of the interleaved pair split of [64,33,2] into " + type_name(type) + (per_node ? " (per node)" : ""));
+            tc->per_node = per_node;
+            tests.push_back(std::move(tc));
+        }
+    }
+    for (bool per_node : {false, true}) {
+        auto tc = make_test([folded_mul](ggml_context* ctx) {
+            ggml_tensor* v = ggml_reshape_3d(ctx, folded_mul(ctx), 128, 40, 3);
+            return ggml_cpy(ctx, v, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 40, 3));
+        }, std::string("CPY of RESHAPE_3D of a folded MUL result") + (per_node ? " (per node)" : ""));
+        tc->per_node = per_node;
+        tests.push_back(std::move(tc));
+    }
+
+    // An attention head split with heads that are not tile-aligned stays on the natural path
+    tests.push_back(make_exact_test([](ggml_context* ctx) {
+        ggml_tensor* q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 320, 64, 1);
+        return ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, q, 40, 8, 64, 1), 0, 2, 1, 3));
+    }, "CONT of a head split of [320,64,1] into 8 heads of 40"));
 
     ///////////////// end of experiment code /////////////////
 
