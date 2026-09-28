@@ -2282,6 +2282,45 @@ static void ggml_backend_metalium_flux_rope(ggml_backend_metalium_context * ctx,
     };
 }
 
+// Prefill SDPA takes the operands exactly as ggml lays them out: Q [ne3, n_head, n_q, dk] and
+// K/V [ne3, n_head_kv, n_kv, dk] in TT order. Permuted (llama.cpp style) operands stay on the legacy path.
+static bool ggml_backend_metalium_fa_use_prefill(const struct ggml_tensor * dst)
+{
+    const ggml_tensor* q = dst->src[0];
+    const ggml_tensor* k = dst->src[1];
+    const ggml_tensor* v = dst->src[2];
+    const ggml_tensor* mask = dst->src[3];
+    for(const ggml_tensor* t : {q, k, v, mask}) {
+        if(t != nullptr && (t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_PERMUTE)) {
+            return false;
+        }
+    }
+
+    // SDPA without MLA needs one head dim, and it rejects padding on it.
+    const int64_t head_dim = q->ne[0];
+    if(k->ne[0] != head_dim || v->ne[0] != head_dim || head_dim % tt::constants::TILE_WIDTH != 0) {
+        return false;
+    }
+    if(k->ne[1] != v->ne[1] || k->ne[2] != v->ne[2] || q->ne[2] % k->ne[2] != 0) {
+        return false;
+    }
+    if(k->ne[3] != q->ne[3] || v->ne[3] != q->ne[3]) {
+        return false;
+    }
+    if(mask != nullptr) {
+        // tt-metal v0.78 SDPA misreads a user mask when the key length is not tile aligned (9, 33 and
+        // 40 keys give 40-80% error); only its internally generated padding mask is exact.
+        if(k->ne[1] % tt::constants::TILE_WIDTH != 0) {
+            return false;
+        }
+        if(mask->ne[0] != k->ne[1] || mask->ne[1] != q->ne[1] ||
+           (mask->ne[2] != 1 && mask->ne[2] != q->ne[2]) || (mask->ne[3] != 1 && mask->ne[3] != q->ne[3])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ggml_backend_metalium_can_flash_attn(const struct ggml_tensor * dst)
 {
     if(!g_debug_flags.experimental_ops) {
@@ -2306,6 +2345,18 @@ static bool ggml_backend_metalium_can_flash_attn(const struct ggml_tensor * dst)
     auto [scale, max_bias, logit_softcap] = params;
 
     if(max_bias != 0.f) {
+        return false;
+    }
+    // Neither SDPA path implements logit softcapping or attention sinks.
+    if(logit_softcap != 0.f || dst->src[4] != nullptr) {
+        return false;
+    }
+    if(ggml_backend_metalium_fa_use_prefill(dst)) {
+        return true;
+    }
+    // The legacy route below was written for llama.cpp-style permuted operands. With ggml's own layout
+    // its decode branch treats query tokens as heads, so leave those nodes to decomposed attention.
+    if(q == dst->src[0] && k == dst->src[1] && v == dst->src[2]) {
         return false;
     }
 
@@ -2367,11 +2418,94 @@ static bool ggml_backend_metalium_can_flash_attn(const struct ggml_tensor * dst)
     return true;
 }
 
+static void ggml_backend_metalium_flash_attn_prefill(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_UNUSED(ctx);
+    ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
+
+    float scale;
+    memcpy(&scale, dst->op_params, sizeof(float));
+
+    auto sdpa_operand = [](const ggml_tensor* tensor) {
+        ttnn::Tensor t = *realize_ggml_view(tensor);
+        if(t.layout() != ttnn::TILE_LAYOUT) {
+            t = ttnn::to_layout(t, ttnn::TILE_LAYOUT);
+        }
+        if(t.dtype() != tt::tt_metal::DataType::BFLOAT16 && t.dtype() != tt::tt_metal::DataType::BFLOAT8_B &&
+           t.dtype() != tt::tt_metal::DataType::BFLOAT4_B) {
+            t = ttnn::typecast(t, tt::tt_metal::DataType::BFLOAT16);
+        }
+        if(t.memory_config().buffer_type() != tt::tt_metal::BufferType::DRAM) {
+            t = ttnn::to_memory_config(t, ttnn::DRAM_MEMORY_CONFIG);
+        }
+        return t;
+    };
+    ttnn::Tensor qt = sdpa_operand(dst->src[0]);
+    ttnn::Tensor kt = sdpa_operand(dst->src[1]);
+    ttnn::Tensor vt = sdpa_operand(dst->src[2]);
+    std::optional<ttnn::Tensor> mask_tensor;
+    if(dst->src[3] != nullptr) {
+        mask_tensor = sdpa_operand(dst->src[3]);
+    }
+
+    // Large head dims keep the configuration validated for ideogram4 (head_dim=256): 128-wide chunks
+    // so the circular buffers fit L1, and ttnn's default compute config. Up to 128, 256-wide chunks
+    // measured fastest (Qwen-Image 2.1: 32 heads, 4096 queries, 4105 keys).
+    const int64_t head_dim = dst->src[0]->ne[0];
+    const bool large_head = head_dim > 128;
+    auto chunk_size = [&](int64_t len) -> uint32_t {
+        if(large_head) {
+            return 128;
+        }
+        uint32_t chunk = tt::constants::TILE_HEIGHT;
+        while(chunk < 256 && chunk < len) {
+            chunk *= 2;
+        }
+        return chunk;
+    };
+    ttnn::operations::transformer::SDPAProgramConfig prog_cfg{
+        .compute_with_storage_grid_size = qt.device()->compute_with_storage_grid_size(),
+        .sub_core_grids                 = std::nullopt,
+        .q_chunk_size                   = chunk_size(dst->src[0]->ne[1]),
+        .k_chunk_size                   = chunk_size(dst->src[1]->ne[1]),
+        .exp_approx_mode                = large_head ? std::nullopt : std::optional<bool>(false),
+    };
+    // Like the ttnn matmul path, precision follows the backend-wide knobs rather than GGML_PREC_F32,
+    // which sd.cpp sets on every FA node: fp32 dest accumulation switches SDPA from its streaming
+    // kernel to a ~40% slower one (Qwen-Image 2.1 shape: 3.81 vs 2.70 ms per layer at HiFi4).
+    std::optional<ttnn::DeviceComputeKernelConfig> kernel_cfg;
+    if(!large_head) {
+        kernel_cfg = make_compute_kernel_config(qt.device());
+    }
+
+    ttnn::Tensor res = ttnn::transformer::scaled_dot_product_attention(
+        qt,
+        kt,
+        vt,
+        mask_tensor,
+        false, /* is_causal */
+        scale,
+        std::nullopt, /* sliding_window_size */
+        std::nullopt, /* memory_config */
+        prog_cfg,
+        kernel_cfg
+    );
+    // SDPA returns [ne3, n_head, n_q, dv]; ggml's result is [dv, n_head, n_q, ne3], i.e. TT [ne3, n_q, n_head, dv].
+    res = ttnn::transpose(res, 1, 2);
+    GGML_ASSERT(ggml_tt_tensors_shape_equal(dst, res));
+    *dst_meta = {
+        .tensor = std::make_shared<ttnn::Tensor>(std::move(res))
+    };
+}
+
 static void ggml_backend_metalium_flash_attn(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
 {
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
-    GGML_UNUSED(ctx);
+    if(ggml_backend_metalium_fa_use_prefill(dst)) {
+        ggml_backend_metalium_flash_attn_prefill(ctx, dst);
+        return;
+    }
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
 
     auto follow_tensor_upstream = [](const ggml_tensor* tensor) -> const ggml_tensor* {
